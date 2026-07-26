@@ -10,8 +10,5 @@ node_modules/
 # Build output
 dist/
 
-# personal settings
-.vscode/settings.json
-
-# file order
-.vscode
+# Vs code
+.vscode/
