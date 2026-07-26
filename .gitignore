@@ -1,4 +1,5 @@
-docs
+# documentation
+documentation
 
 # Environment variables
 .env
@@ -11,3 +12,6 @@ dist/
 
 # personal settings
 .vscode/settings.json
+
+# file order
+.vscode

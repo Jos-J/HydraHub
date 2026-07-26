@@ -1,0 +1,25 @@
+{
+    "folders": [
+        {
+            "path": "client"
+        },
+        {
+            "path": "server"
+        },
+        {
+            "path": "database"
+        },
+        {
+            "path": "cpp-tools"
+        },
+        {
+            "path": "documentation"
+        },
+        {
+            "path": "scripts"
+        }
+    ],
+    "settings": {
+        "explorer.sortOrder": "modified"
+    }
+}
