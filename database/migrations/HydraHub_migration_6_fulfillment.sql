@@ -1,5 +1,5 @@
 -- migration 6 -- fulfillment 
-
+-------------------------------------
 BEGIN;
 
 CREATE SCHEMA fulfillment;
@@ -1588,5 +1588,1071 @@ END;
 $function$;
 
 ---------------------------------------------------------
-------------------
+----------------fulfillment.pick_fulfillment_order_item
 ---------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fulfillment.pick_fulfillment_order_item(
+    p_fulfillment_order_item_id bigint,
+    p_quantity integer,
+    p_performed_by_user_id integer DEFAULT NULL,
+    p_reason text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL
+)
+RETURNS fulfillment.fulfillment_order_items
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_fulfillment_order_id bigint;
+
+    v_order fulfillment.fulfillment_orders%ROWTYPE;
+    v_item fulfillment.fulfillment_order_items%ROWTYPE;
+    v_updated_item fulfillment.fulfillment_order_items%ROWTYPE;
+
+    v_remaining_pickable integer;
+
+    v_previous_status_code varchar(30);
+    v_new_status_code varchar(30);
+
+    v_total_required bigint;
+    v_total_reserved bigint;
+    v_total_picked bigint;
+    v_total_shipped bigint;
+BEGIN
+    /*
+     * Validate parameters.
+     */
+    IF p_fulfillment_order_item_id IS NULL THEN
+        RAISE EXCEPTION
+            'fulfillment_order_item_id is required'
+            USING ERRCODE = '22004';
+    END IF;
+
+    IF p_fulfillment_order_item_id <= 0 THEN
+        RAISE EXCEPTION
+            'fulfillment_order_item_id must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_quantity IS NULL OR p_quantity <= 0 THEN
+        RAISE EXCEPTION
+            'Pick quantity must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_reason IS NOT NULL
+       AND btrim(p_reason) = '' THEN
+        RAISE EXCEPTION
+            'reason cannot be blank when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_metadata IS NOT NULL
+       AND jsonb_typeof(p_metadata) <> 'object' THEN
+        RAISE EXCEPTION
+            'metadata must be a JSON object when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    /*
+     * Resolve the parent fulfillment order.
+     */
+    SELECT fulfillment_order_id
+    INTO v_fulfillment_order_id
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_item_id =
+          p_fulfillment_order_item_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % does not exist',
+            p_fulfillment_order_item_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Lock the parent order first.
+     */
+    SELECT *
+    INTO v_order
+    FROM fulfillment.fulfillment_orders
+    WHERE fulfillment_order_id =
+          v_fulfillment_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment order % does not exist',
+            v_fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Only active warehouse-processing states may be picked.
+     */
+    IF v_order.status_code NOT IN (
+        'partially_reserved',
+        'reserved',
+        'picking',
+        'partially_picked'
+    ) THEN
+        RAISE EXCEPTION
+            'Fulfillment order % cannot be picked because its current status is %',
+            v_order.fulfillment_order_id,
+            v_order.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock the fulfillment line.
+     */
+    SELECT *
+    INTO v_item
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_item_id =
+          p_fulfillment_order_item_id
+      AND fulfillment_order_id =
+          v_order.fulfillment_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % no longer exists on fulfillment order %',
+            p_fulfillment_order_item_id,
+            v_order.fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Determine how much currently reserved inventory remains
+     * available to pick.
+     *
+     * Shipped quantities are added back because shipping will move
+     * inventory out of reserved_quantity while picked_quantity remains
+     * a cumulative workflow quantity.
+     */
+    v_remaining_pickable :=
+        v_item.reserved_quantity
+        + v_item.shipped_quantity
+        - v_item.picked_quantity;
+
+    IF v_remaining_pickable <= 0 THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % has no reserved quantity remaining to pick',
+            p_fulfillment_order_item_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF p_quantity > v_remaining_pickable THEN
+        RAISE EXCEPTION
+            'Pick quantity exceeds reserved availability for fulfillment-order item %. Requested pick: %, remaining pickable: %',
+            p_fulfillment_order_item_id,
+            p_quantity,
+            v_remaining_pickable
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    v_previous_status_code := v_order.status_code;
+
+    /*
+     * Record the picked quantity on the fulfillment line.
+     */
+    UPDATE fulfillment.fulfillment_order_items
+    SET
+        picked_quantity =
+            picked_quantity + p_quantity,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_item_id =
+          v_item.fulfillment_order_item_id
+    RETURNING *
+    INTO v_updated_item;
+
+    /*
+     * Recalculate fulfillment-order progress.
+     */
+    SELECT
+        COALESCE(
+            SUM(requested_quantity - cancelled_quantity),
+            0
+        ),
+        COALESCE(SUM(reserved_quantity), 0),
+        COALESCE(SUM(picked_quantity), 0),
+        COALESCE(SUM(shipped_quantity), 0)
+    INTO
+        v_total_required,
+        v_total_reserved,
+        v_total_picked,
+        v_total_shipped
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id;
+
+    IF v_total_picked >= v_total_required THEN
+        v_new_status_code := 'picked';
+
+    ELSIF v_total_picked > 0 THEN
+        v_new_status_code := 'partially_picked';
+
+    ELSIF v_total_reserved + v_total_shipped >=
+          v_total_required THEN
+        v_new_status_code := 'reserved';
+
+    ELSIF v_total_reserved > 0 THEN
+        v_new_status_code := 'partially_reserved';
+
+    ELSE
+        v_new_status_code := 'pending';
+    END IF;
+
+    UPDATE fulfillment.fulfillment_orders
+    SET
+        status_code = v_new_status_code,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id;
+
+    /*
+     * Append the immutable picking event.
+     */
+    INSERT INTO fulfillment.fulfillment_events (
+        organization_id,
+        fulfillment_order_id,
+        fulfillment_order_item_id,
+        event_type,
+        previous_status_code,
+        new_status_code,
+        previous_quantity,
+        new_quantity,
+        reason,
+        metadata,
+        performed_by_user_id
+    )
+    VALUES (
+        v_order.organization_id,
+        v_order.fulfillment_order_id,
+        v_item.fulfillment_order_item_id,
+        'picked',
+        v_previous_status_code,
+        v_new_status_code,
+        v_item.picked_quantity,
+        v_updated_item.picked_quantity,
+        p_reason,
+        COALESCE(p_metadata, '{}'::jsonb)
+        ||
+        jsonb_build_object(
+            'picked_quantity', p_quantity,
+            'reserved_quantity',
+                v_updated_item.reserved_quantity,
+            'remaining_pickable',
+                v_updated_item.reserved_quantity
+                + v_updated_item.shipped_quantity
+                - v_updated_item.picked_quantity
+        ),
+        p_performed_by_user_id
+    );
+
+    RETURN v_updated_item;
+END;
+$function$;
+
+--------------------------------------------------------
+----------pack fulfillment order item fucntion 
+--------------------------------------------------------
+CREATE OR REPLACE FUNCTION fulfillment.pack_fulfillment_order_item(
+    p_fulfillment_order_item_id bigint,
+    p_quantity integer,
+    p_performed_by_user_id integer DEFAULT NULL,
+    p_reason text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL
+)
+RETURNS fulfillment.fulfillment_order_items
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_fulfillment_order_id bigint;
+
+    v_order fulfillment.fulfillment_orders%ROWTYPE;
+    v_item fulfillment.fulfillment_order_items%ROWTYPE;
+    v_updated_item fulfillment.fulfillment_order_items%ROWTYPE;
+
+    v_remaining_packable integer;
+
+    v_previous_status_code varchar(30);
+    v_new_status_code varchar(30);
+
+    v_total_required bigint;
+    v_total_reserved bigint;
+    v_total_picked bigint;
+    v_total_packed bigint;
+    v_total_shipped bigint;
+BEGIN
+    /*
+     * Validate parameters.
+     */
+    IF p_fulfillment_order_item_id IS NULL THEN
+        RAISE EXCEPTION
+            'fulfillment_order_item_id is required'
+            USING ERRCODE = '22004';
+    END IF;
+
+    IF p_fulfillment_order_item_id <= 0 THEN
+        RAISE EXCEPTION
+            'fulfillment_order_item_id must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_quantity IS NULL OR p_quantity <= 0 THEN
+        RAISE EXCEPTION
+            'Pack quantity must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_reason IS NOT NULL
+       AND btrim(p_reason) = '' THEN
+        RAISE EXCEPTION
+            'reason cannot be blank when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_metadata IS NOT NULL
+       AND jsonb_typeof(p_metadata) <> 'object' THEN
+        RAISE EXCEPTION
+            'metadata must be a JSON object when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    /*
+     * Resolve the parent fulfillment order.
+     */
+    SELECT fulfillment_order_id
+    INTO v_fulfillment_order_id
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_item_id =
+          p_fulfillment_order_item_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % does not exist',
+            p_fulfillment_order_item_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Lock the parent order first.
+     */
+    SELECT *
+    INTO v_order
+    FROM fulfillment.fulfillment_orders
+    WHERE fulfillment_order_id =
+          v_fulfillment_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment order % does not exist',
+            v_fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Packing may begin after at least some inventory has been picked.
+     * This supports packing while additional items are still being picked.
+     */
+    IF v_order.status_code NOT IN (
+        'partially_picked',
+        'picked',
+        'packing',
+        'partially_packed'
+    ) THEN
+        RAISE EXCEPTION
+            'Fulfillment order % cannot be packed because its current status is %',
+            v_order.fulfillment_order_id,
+            v_order.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock the fulfillment line.
+     */
+    SELECT *
+    INTO v_item
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_item_id =
+          p_fulfillment_order_item_id
+      AND fulfillment_order_id =
+          v_order.fulfillment_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % no longer exists on fulfillment order %',
+            p_fulfillment_order_item_id,
+            v_order.fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Only picked inventory may be packed.
+     */
+    v_remaining_packable :=
+        v_item.picked_quantity
+        - v_item.packed_quantity;
+
+    IF v_remaining_packable <= 0 THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % has no picked quantity remaining to pack',
+            p_fulfillment_order_item_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF p_quantity > v_remaining_packable THEN
+        RAISE EXCEPTION
+            'Pack quantity exceeds picked availability for fulfillment-order item %. Requested pack: %, remaining packable: %',
+            p_fulfillment_order_item_id,
+            p_quantity,
+            v_remaining_packable
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    v_previous_status_code := v_order.status_code;
+
+    /*
+     * Record the packed quantity on the fulfillment line.
+     */
+    UPDATE fulfillment.fulfillment_order_items
+    SET
+        packed_quantity =
+            packed_quantity + p_quantity,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_item_id =
+          v_item.fulfillment_order_item_id
+    RETURNING *
+    INTO v_updated_item;
+
+    /*
+     * Recalculate the fulfillment order's workflow status.
+     *
+     * Later workflow stages take precedence over earlier stages.
+     */
+    SELECT
+        COALESCE(
+            SUM(requested_quantity - cancelled_quantity),
+            0
+        ),
+        COALESCE(SUM(reserved_quantity), 0),
+        COALESCE(SUM(picked_quantity), 0),
+        COALESCE(SUM(packed_quantity), 0),
+        COALESCE(SUM(shipped_quantity), 0)
+    INTO
+        v_total_required,
+        v_total_reserved,
+        v_total_picked,
+        v_total_packed,
+        v_total_shipped
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id;
+
+    IF v_total_packed >= v_total_required THEN
+        v_new_status_code := 'packed';
+
+    ELSIF v_total_packed > 0 THEN
+        v_new_status_code := 'partially_packed';
+
+    ELSIF v_total_picked >= v_total_required THEN
+        v_new_status_code := 'picked';
+
+    ELSIF v_total_picked > 0 THEN
+        v_new_status_code := 'partially_picked';
+
+    ELSIF v_total_reserved + v_total_shipped >=
+          v_total_required THEN
+        v_new_status_code := 'reserved';
+
+    ELSIF v_total_reserved > 0 THEN
+        v_new_status_code := 'partially_reserved';
+
+    ELSE
+        v_new_status_code := 'pending';
+    END IF;
+
+    UPDATE fulfillment.fulfillment_orders
+    SET
+        status_code = v_new_status_code,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id;
+
+    /*
+     * Append the immutable packing event.
+     */
+    INSERT INTO fulfillment.fulfillment_events (
+        organization_id,
+        fulfillment_order_id,
+        fulfillment_order_item_id,
+        event_type,
+        previous_status_code,
+        new_status_code,
+        previous_quantity,
+        new_quantity,
+        reason,
+        metadata,
+        performed_by_user_id
+    )
+    VALUES (
+        v_order.organization_id,
+        v_order.fulfillment_order_id,
+        v_item.fulfillment_order_item_id,
+        'packed',
+        v_previous_status_code,
+        v_new_status_code,
+        v_item.packed_quantity,
+        v_updated_item.packed_quantity,
+        p_reason,
+        COALESCE(p_metadata, '{}'::jsonb)
+        ||
+        jsonb_build_object(
+            'packed_quantity',
+                p_quantity,
+            'picked_quantity',
+                v_updated_item.picked_quantity,
+            'remaining_packable',
+                v_updated_item.picked_quantity
+                - v_updated_item.packed_quantity
+        ),
+        p_performed_by_user_id
+    );
+
+    RETURN v_updated_item;
+END;
+$function$;
+-------------------------------------------
+----------------shipping function
+-------------------------------------------
+
+CREATE OR REPLACE FUNCTION fulfillment.ship_fulfillment_order_item(
+    p_reservation_id bigint,
+    p_performed_by_user_id integer DEFAULT NULL,
+    p_reason text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL
+)
+RETURNS fulfillment.fulfillment_order_items
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_reservation inventory.reservations%ROWTYPE;
+    v_fulfilled_reservation inventory.reservations%ROWTYPE;
+
+    v_order fulfillment.fulfillment_orders%ROWTYPE;
+    v_item fulfillment.fulfillment_order_items%ROWTYPE;
+    v_updated_item fulfillment.fulfillment_order_items%ROWTYPE;
+
+    v_sales_order_item public.sales_order_items%ROWTYPE;
+
+    v_previous_status_code varchar(30);
+    v_new_status_code varchar(30);
+
+    v_remaining_shippable integer;
+
+    v_total_required bigint;
+    v_total_reserved bigint;
+    v_total_picked bigint;
+    v_total_packed bigint;
+    v_total_shipped bigint;
+BEGIN
+    /*
+     * Validate parameters.
+     */
+    IF p_reservation_id IS NULL THEN
+        RAISE EXCEPTION
+            'reservation_id is required'
+            USING ERRCODE = '22004';
+    END IF;
+
+    IF p_reservation_id <= 0 THEN
+        RAISE EXCEPTION
+            'reservation_id must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_reason IS NOT NULL
+       AND btrim(p_reason) = '' THEN
+        RAISE EXCEPTION
+            'reason cannot be blank when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_metadata IS NOT NULL
+       AND jsonb_typeof(p_metadata) <> 'object' THEN
+        RAISE EXCEPTION
+            'metadata must be a JSON object when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    /*
+     * Lock and validate the inventory reservation.
+     */
+    SELECT *
+    INTO v_reservation
+    FROM inventory.reservations
+    WHERE reservation_id = p_reservation_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Reservation % does not exist',
+            p_reservation_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    IF v_reservation.status_code <> 'active' THEN
+        RAISE EXCEPTION
+            'Reservation % cannot be shipped because its current status is %',
+            p_reservation_id,
+            v_reservation.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF v_reservation.source_type_code <> 'fulfillment_order' THEN
+        RAISE EXCEPTION
+            'Reservation % is not associated with a fulfillment order',
+            p_reservation_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF v_reservation.source_id IS NULL
+       OR v_reservation.source_line_id IS NULL THEN
+        RAISE EXCEPTION
+            'Reservation % is missing its fulfillment source identifiers',
+            p_reservation_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock the fulfillment order.
+     */
+    SELECT *
+    INTO v_order
+    FROM fulfillment.fulfillment_orders
+    WHERE fulfillment_order_id =
+          v_reservation.source_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment order % associated with reservation % does not exist',
+            v_reservation.source_id,
+            p_reservation_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Shipping may occur only after inventory has been packed.
+     */
+    IF v_order.status_code NOT IN (
+        'partially_packed',
+        'packed',
+        'partially_shipped'
+    ) THEN
+        RAISE EXCEPTION
+            'Fulfillment order % cannot be shipped because its current status is %',
+            v_order.fulfillment_order_id,
+            v_order.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock the fulfillment line identified by the reservation.
+     */
+    SELECT *
+    INTO v_item
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_item_id =
+          v_reservation.source_line_id
+      AND fulfillment_order_id =
+          v_order.fulfillment_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % associated with reservation % does not exist on fulfillment order %',
+            v_reservation.source_line_id,
+            p_reservation_id,
+            v_order.fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Confirm that the reservation points to the same warehouse
+     * inventory represented by this fulfillment order and line.
+     */
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.warehouse_inventory wi
+        WHERE wi.warehouse_inventory_id =
+              v_reservation.warehouse_inventory_id
+          AND wi.warehouse_id =
+              v_order.warehouse_id
+          AND wi.variant_id =
+              v_item.variant_id
+    ) THEN
+        RAISE EXCEPTION
+            'Reservation % does not match warehouse % and variant % for fulfillment-order item %',
+            p_reservation_id,
+            v_order.warehouse_id,
+            v_item.variant_id,
+            v_item.fulfillment_order_item_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Only packed inventory may ship.
+     */
+    v_remaining_shippable :=
+        v_item.packed_quantity
+        - v_item.shipped_quantity;
+
+    IF v_remaining_shippable <= 0 THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % has no packed quantity remaining to ship',
+            v_item.fulfillment_order_item_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF v_reservation.quantity > v_remaining_shippable THEN
+        RAISE EXCEPTION
+            'Reservation % quantity exceeds packed availability for fulfillment-order item %. Reservation quantity: %, remaining shippable: %',
+            p_reservation_id,
+            v_item.fulfillment_order_item_id,
+            v_reservation.quantity,
+            v_remaining_shippable
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF v_reservation.quantity > v_item.reserved_quantity THEN
+        RAISE EXCEPTION
+            'Reservation % quantity exceeds the fulfillment line reserved balance. Reservation quantity: %, line reserved quantity: %',
+            p_reservation_id,
+            v_reservation.quantity,
+            v_item.reserved_quantity
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock and validate the related sales-order item.
+     */
+    SELECT *
+    INTO v_sales_order_item
+    FROM public.sales_order_items
+    WHERE sales_order_item_id =
+          v_item.sales_order_item_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Sales-order item % associated with fulfillment-order item % does not exist',
+            v_item.sales_order_item_id,
+            v_item.fulfillment_order_item_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    IF v_sales_order_item.fulfilled_quantity
+       + v_sales_order_item.cancelled_quantity
+       + v_reservation.quantity
+       > v_sales_order_item.quantity THEN
+        RAISE EXCEPTION
+            'Shipping reservation % would exceed sales-order item %. Ordered: %, fulfilled: %, cancelled: %, shipping now: %',
+            p_reservation_id,
+            v_sales_order_item.sales_order_item_id,
+            v_sales_order_item.quantity,
+            v_sales_order_item.fulfilled_quantity,
+            v_sales_order_item.cancelled_quantity,
+            v_reservation.quantity
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    v_previous_status_code := v_order.status_code;
+
+    /*
+     * Delegate inventory consumption to the inventory engine.
+     *
+     * This decreases both quantity_on_hand and quantity_reserved
+     * and moves the reservation to fulfilled.
+     */
+    v_fulfilled_reservation :=
+        inventory.fulfill_reservation(
+            p_reservation_id        => p_reservation_id,
+            p_performed_by_user_id  => p_performed_by_user_id,
+            p_reason                => p_reason,
+            p_metadata              =>
+                COALESCE(p_metadata, '{}'::jsonb)
+                ||
+                jsonb_build_object(
+                    'fulfillment_order_id',
+                    v_order.fulfillment_order_id,
+                    'fulfillment_order_item_id',
+                    v_item.fulfillment_order_item_id
+                )
+        );
+
+    /*
+     * Move the quantity from reserved to shipped on the
+     * fulfillment line.
+     */
+    UPDATE fulfillment.fulfillment_order_items
+    SET
+        reserved_quantity =
+            reserved_quantity - v_reservation.quantity,
+        shipped_quantity =
+            shipped_quantity + v_reservation.quantity,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_item_id =
+          v_item.fulfillment_order_item_id
+    RETURNING *
+    INTO v_updated_item;
+
+/*
+ * Record fulfillment against the sales-order line.
+ */
+ 
+UPDATE public.sales_order_items
+SET
+    fulfilled_quantity =
+        fulfilled_quantity + v_reservation.quantity
+WHERE sales_order_item_id =
+      v_item.sales_order_item_id
+RETURNING *
+INTO v_sales_order_item;
+
+/*
+ * Keep the parent sales-order status synchronized.
+ */
+PERFORM public.recalculate_sales_order_status(
+    v_order.sales_order_id
+);
+
+    /*
+     * Recalculate fulfillment-order progress.
+     * Later workflow stages take precedence.
+     */
+    SELECT
+        COALESCE(
+            SUM(requested_quantity - cancelled_quantity),
+            0
+        ),
+        COALESCE(SUM(reserved_quantity), 0),
+        COALESCE(SUM(picked_quantity), 0),
+        COALESCE(SUM(packed_quantity), 0),
+        COALESCE(SUM(shipped_quantity), 0)
+    INTO
+        v_total_required,
+        v_total_reserved,
+        v_total_picked,
+        v_total_packed,
+        v_total_shipped
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id;
+
+    IF v_total_shipped >= v_total_required THEN
+        v_new_status_code := 'shipped';
+
+    ELSIF v_total_shipped > 0 THEN
+        v_new_status_code := 'partially_shipped';
+
+    ELSIF v_total_packed >= v_total_required THEN
+        v_new_status_code := 'packed';
+
+    ELSIF v_total_packed > 0 THEN
+        v_new_status_code := 'partially_packed';
+
+    ELSIF v_total_picked >= v_total_required THEN
+        v_new_status_code := 'picked';
+
+    ELSIF v_total_picked > 0 THEN
+        v_new_status_code := 'partially_picked';
+
+    ELSIF v_total_reserved >= v_total_required THEN
+        v_new_status_code := 'reserved';
+
+    ELSIF v_total_reserved > 0 THEN
+        v_new_status_code := 'partially_reserved';
+
+    ELSE
+        v_new_status_code := 'pending';
+    END IF;
+
+  UPDATE fulfillment.fulfillment_orders
+SET
+    status_code = v_new_status_code,
+
+    completed_at =
+        CASE
+            WHEN v_new_status_code = 'shipped'
+                THEN CURRENT_TIMESTAMP
+            ELSE NULL
+        END,
+
+    cancelled_at = NULL,
+
+    updated_at = CURRENT_TIMESTAMP
+	WHERE fulfillment_order_id =
+      v_order.fulfillment_order_id
+	  RETURNING *
+	  INTO v_order;
+
+    /*
+     * Append the immutable shipping event.
+     */
+    INSERT INTO fulfillment.fulfillment_events (
+        organization_id,
+        fulfillment_order_id,
+        fulfillment_order_item_id,
+        reservation_id,
+        event_type,
+        previous_status_code,
+        new_status_code,
+        previous_quantity,
+        new_quantity,
+        reason,
+        metadata,
+        performed_by_user_id
+    )
+    VALUES (
+        v_order.organization_id,
+        v_order.fulfillment_order_id,
+        v_item.fulfillment_order_item_id,
+        v_fulfilled_reservation.reservation_id,
+        'shipped',
+        v_previous_status_code,
+        v_new_status_code,
+        v_item.shipped_quantity,
+        v_updated_item.shipped_quantity,
+        p_reason,
+        COALESCE(p_metadata, '{}'::jsonb)
+        ||
+        jsonb_build_object(
+            'shipped_quantity',
+                v_reservation.quantity,
+            'warehouse_inventory_id',
+                v_reservation.warehouse_inventory_id,
+            'reservation_status',
+                v_fulfilled_reservation.status_code,
+            'remaining_reserved_quantity',
+                v_updated_item.reserved_quantity
+        ),
+        p_performed_by_user_id
+    );
+
+    RETURN v_updated_item;
+END;
+$function$;
+--------------------------------------------------
+-----------public.recalculate_sales_order_status
+--------------------------------------------------
+CREATE OR REPLACE FUNCTION public.recalculate_sales_order_status(
+    p_sales_order_id integer
+)
+RETURNS public.sales_orders
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_sales_order public.sales_orders%ROWTYPE;
+    v_updated_sales_order public.sales_orders%ROWTYPE;
+
+    v_total_quantity bigint;
+    v_total_fulfilled bigint;
+    v_total_cancelled bigint;
+    v_total_required bigint;
+
+    v_new_status varchar(30);
+BEGIN
+    /*
+     * Validate the request.
+     */
+    IF p_sales_order_id IS NULL THEN
+        RAISE EXCEPTION
+            'sales_order_id is required'
+            USING ERRCODE = '22004';
+    END IF;
+
+    IF p_sales_order_id <= 0 THEN
+        RAISE EXCEPTION
+            'sales_order_id must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    /*
+     * Lock the parent sales order.
+     */
+    SELECT *
+    INTO v_sales_order
+    FROM public.sales_orders
+    WHERE sales_order_id = p_sales_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Sales order % does not exist',
+            p_sales_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Do not recalculate an explicitly cancelled order.
+     */
+    IF v_sales_order.status = 'CANCELLED' THEN
+        RETURN v_sales_order;
+    END IF;
+
+    /*
+     * Calculate fulfillment progress across all sales-order items.
+     */
+    SELECT
+        COALESCE(SUM(quantity), 0),
+        COALESCE(SUM(fulfilled_quantity), 0),
+        COALESCE(SUM(cancelled_quantity), 0)
+    INTO
+        v_total_quantity,
+        v_total_fulfilled,
+        v_total_cancelled
+    FROM public.sales_order_items
+    WHERE sales_order_id = p_sales_order_id;
+
+    IF v_total_quantity = 0 THEN
+        RAISE EXCEPTION
+            'Sales order % has no sales-order items',
+            p_sales_order_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    v_total_required :=
+        v_total_quantity - v_total_cancelled;
+
+    /*
+     * Preserve the current status when nothing has shipped.
+     */
+    IF v_total_fulfilled = 0 THEN
+        RETURN v_sales_order;
+    END IF;
+
+    IF v_total_required > 0
+       AND v_total_fulfilled >= v_total_required THEN
+        v_new_status := 'FULFILLED';
+    ELSE
+        v_new_status := 'PARTIALLY_FULFILLED';
+    END IF;
+
+    UPDATE public.sales_orders
+    SET
+        status = v_new_status,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE sales_order_id = p_sales_order_id
+    RETURNING *
+    INTO v_updated_sales_order;
+
+    RETURN v_updated_sales_order;
+END;
+$function$;
+----------------------------------------------------
+------------
+----------------------------------------------------
