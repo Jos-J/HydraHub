@@ -2653,6 +2653,613 @@ BEGIN
     RETURN v_updated_sales_order;
 END;
 $function$;
-----------------------------------------------------
-------------
-----------------------------------------------------
+--------------------------------------------------------------
+------------ fullfilment.cancel_fullfilment_order_items
+--------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fulfillment.cancel_fulfillment_order_item(
+    p_reservation_id bigint,
+    p_performed_by_user_id integer DEFAULT NULL,
+    p_reason text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL
+)
+RETURNS fulfillment.fulfillment_order_items
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_reservation inventory.reservations%ROWTYPE;
+    v_cancelled_reservation inventory.reservations%ROWTYPE;
+
+    v_order fulfillment.fulfillment_orders%ROWTYPE;
+    v_item fulfillment.fulfillment_order_items%ROWTYPE;
+    v_updated_item fulfillment.fulfillment_order_items%ROWTYPE;
+
+    v_previous_status_code varchar(30);
+    v_new_status_code varchar(30);
+BEGIN
+    /*
+     * Validate parameters.
+     */
+    IF p_reservation_id IS NULL THEN
+        RAISE EXCEPTION
+            'reservation_id is required'
+            USING ERRCODE = '22004';
+    END IF;
+
+    IF p_reservation_id <= 0 THEN
+        RAISE EXCEPTION
+            'reservation_id must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_reason IS NOT NULL
+       AND btrim(p_reason) = '' THEN
+        RAISE EXCEPTION
+            'reason cannot be blank when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_metadata IS NOT NULL
+       AND jsonb_typeof(p_metadata) <> 'object' THEN
+        RAISE EXCEPTION
+            'metadata must be a JSON object when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    /*
+     * Lock the reservation.
+     */
+    SELECT *
+    INTO v_reservation
+    FROM inventory.reservations
+    WHERE reservation_id = p_reservation_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Reservation % does not exist',
+            p_reservation_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    IF v_reservation.status_code <> 'active' THEN
+        RAISE EXCEPTION
+            'Reservation % cannot be cancelled from fulfillment because its current status is %',
+            p_reservation_id,
+            v_reservation.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF v_reservation.source_type_code <> 'fulfillment_order' THEN
+        RAISE EXCEPTION
+            'Reservation % is not associated with a fulfillment order',
+            p_reservation_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock the parent fulfillment order.
+     */
+    SELECT *
+    INTO v_order
+    FROM fulfillment.fulfillment_orders
+    WHERE fulfillment_order_id = v_reservation.source_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment order % does not exist',
+            v_reservation.source_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * For this first cancellation implementation, only quantities that
+     * have not progressed into picking may be cancelled.
+     */
+    IF v_order.status_code NOT IN (
+        'pending',
+        'partially_reserved',
+        'reserved'
+    ) THEN
+        RAISE EXCEPTION
+            'Fulfillment order % cannot be cancelled at its current status %',
+            v_order.fulfillment_order_id,
+            v_order.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock the fulfillment item.
+     */
+    SELECT *
+    INTO v_item
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_item_id = v_reservation.source_line_id
+      AND fulfillment_order_id = v_order.fulfillment_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % does not exist on fulfillment order %',
+            v_reservation.source_line_id,
+            v_order.fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    IF v_item.picked_quantity > 0
+       OR v_item.packed_quantity > 0
+       OR v_item.shipped_quantity > 0 THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % cannot be cancelled because warehouse processing has already begun',
+            v_item.fulfillment_order_item_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF v_reservation.quantity > v_item.reserved_quantity THEN
+        RAISE EXCEPTION
+            'Reservation % quantity exceeds fulfillment item reserved quantity',
+            p_reservation_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    v_previous_status_code := v_order.status_code;
+
+    /*
+     * Delegate inventory cancellation to the inventory engine.
+     */
+    v_cancelled_reservation :=
+        inventory.cancel_reservation(
+            p_reservation_id       => p_reservation_id,
+            p_performed_by_user_id => p_performed_by_user_id,
+            p_reason               => p_reason,
+            p_metadata             =>
+                COALESCE(p_metadata, '{}'::jsonb)
+                ||
+                jsonb_build_object(
+                    'fulfillment_order_id',
+                    v_order.fulfillment_order_id,
+                    'fulfillment_order_item_id',
+                    v_item.fulfillment_order_item_id
+                )
+        );
+
+    /*
+     * Move the quantity out of reserved and into cancelled.
+     */
+    UPDATE fulfillment.fulfillment_order_items
+    SET
+        reserved_quantity =
+            reserved_quantity - v_reservation.quantity,
+        cancelled_quantity =
+            cancelled_quantity + v_reservation.quantity,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_item_id =
+          v_item.fulfillment_order_item_id
+    RETURNING *
+    INTO v_updated_item;
+
+    /*
+     * Recalculate the parent fulfillment-order status.
+     */
+    IF NOT EXISTS (
+        SELECT 1
+        FROM fulfillment.fulfillment_order_items
+        WHERE fulfillment_order_id = v_order.fulfillment_order_id
+          AND cancelled_quantity < requested_quantity
+    ) THEN
+        v_new_status_code := 'cancelled';
+    ELSE
+        v_new_status_code := 'partially_reserved';
+    END IF;
+
+    UPDATE fulfillment.fulfillment_orders
+    SET
+        status_code = v_new_status_code,
+        cancelled_at =
+            CASE
+                WHEN v_new_status_code = 'cancelled'
+                    THEN CURRENT_TIMESTAMP
+                ELSE NULL
+            END,
+        completed_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id
+    RETURNING *
+    INTO v_order;
+
+    /*
+     * Append immutable fulfillment cancellation event.
+     */
+    INSERT INTO fulfillment.fulfillment_events (
+        organization_id,
+        fulfillment_order_id,
+        fulfillment_order_item_id,
+        reservation_id,
+        event_type,
+        previous_status_code,
+        new_status_code,
+        previous_quantity,
+        new_quantity,
+        reason,
+        metadata,
+        performed_by_user_id
+    )
+    VALUES (
+        v_order.organization_id,
+        v_order.fulfillment_order_id,
+        v_item.fulfillment_order_item_id,
+        v_cancelled_reservation.reservation_id,
+        'cancelled',
+        v_previous_status_code,
+        v_new_status_code,
+        v_item.cancelled_quantity,
+        v_updated_item.cancelled_quantity,
+        p_reason,
+        COALESCE(p_metadata, '{}'::jsonb)
+        ||
+        jsonb_build_object(
+            'cancelled_quantity',
+                v_reservation.quantity,
+            'remaining_reserved_quantity',
+                v_updated_item.reserved_quantity,
+            'reservation_status',
+                v_cancelled_reservation.status_code
+        ),
+        p_performed_by_user_id
+    );
+
+    RETURN v_updated_item;
+END;
+$function$;
+------------------------------------------------------------------------------
+------------------------fullfillment.partial_cancel_fulfillment_order_item()
+------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fulfillment.partial_cancel_fulfillment_order_item(
+    p_reservation_id bigint,
+    p_quantity integer,
+    p_performed_by_user_id integer DEFAULT NULL,
+    p_reason text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL
+)
+RETURNS fulfillment.fulfillment_order_items
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_reservation inventory.reservations%ROWTYPE;
+    v_adjusted_reservation inventory.reservations%ROWTYPE;
+
+    v_order fulfillment.fulfillment_orders%ROWTYPE;
+    v_item fulfillment.fulfillment_order_items%ROWTYPE;
+    v_updated_item fulfillment.fulfillment_order_items%ROWTYPE;
+
+    v_previous_status_code varchar(30);
+    v_new_status_code varchar(30);
+
+    v_new_reservation_quantity integer;
+
+    v_total_required bigint;
+    v_total_reserved bigint;
+    v_total_picked bigint;
+    v_total_packed bigint;
+    v_total_shipped bigint;
+BEGIN
+    /*
+     * Validate parameters.
+     */
+    IF p_reservation_id IS NULL THEN
+        RAISE EXCEPTION
+            'reservation_id is required'
+            USING ERRCODE = '22004';
+    END IF;
+
+    IF p_reservation_id <= 0 THEN
+        RAISE EXCEPTION
+            'reservation_id must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_quantity IS NULL OR p_quantity <= 0 THEN
+        RAISE EXCEPTION
+            'Partial cancellation quantity must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_reason IS NOT NULL
+       AND btrim(p_reason) = '' THEN
+        RAISE EXCEPTION
+            'reason cannot be blank when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_metadata IS NOT NULL
+       AND jsonb_typeof(p_metadata) <> 'object' THEN
+        RAISE EXCEPTION
+            'metadata must be a JSON object when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    /*
+     * Lock reservation.
+     */
+    SELECT *
+    INTO v_reservation
+    FROM inventory.reservations
+    WHERE reservation_id = p_reservation_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Reservation % does not exist',
+            p_reservation_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    IF v_reservation.status_code <> 'active' THEN
+        RAISE EXCEPTION
+            'Reservation % cannot be partially cancelled because its current status is %',
+            p_reservation_id,
+            v_reservation.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF v_reservation.source_type_code <> 'fulfillment_order' THEN
+        RAISE EXCEPTION
+            'Reservation % is not associated with a fulfillment order',
+            p_reservation_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * This function is intentionally for PARTIAL cancellation only.
+     * Full reservation cancellation remains the responsibility of
+     * cancel_fulfillment_order_item().
+     */
+    IF p_quantity >= v_reservation.quantity THEN
+        RAISE EXCEPTION
+            'Partial cancellation quantity must be less than reservation %. Reservation quantity: %, requested cancellation: %',
+            p_reservation_id,
+            v_reservation.quantity,
+            p_quantity
+            USING ERRCODE = '22023';
+    END IF;
+
+    /*
+     * Lock parent fulfillment order.
+     */
+    SELECT *
+    INTO v_order
+    FROM fulfillment.fulfillment_orders
+    WHERE fulfillment_order_id = v_reservation.source_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment order % does not exist',
+            v_reservation.source_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Partial cancellation is allowed only before picking begins.
+     */
+    IF v_order.status_code NOT IN (
+        'partially_reserved',
+        'reserved'
+    ) THEN
+        RAISE EXCEPTION
+            'Fulfillment order % cannot be partially cancelled at its current status %',
+            v_order.fulfillment_order_id,
+            v_order.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock fulfillment item.
+     */
+    SELECT *
+    INTO v_item
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_item_id = v_reservation.source_line_id
+      AND fulfillment_order_id = v_order.fulfillment_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % does not exist on fulfillment order %',
+            v_reservation.source_line_id,
+            v_order.fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    IF v_item.picked_quantity > 0
+       OR v_item.packed_quantity > 0
+       OR v_item.shipped_quantity > 0 THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % cannot be partially cancelled because warehouse processing has already begun',
+            v_item.fulfillment_order_item_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF p_quantity > v_item.reserved_quantity THEN
+        RAISE EXCEPTION
+            'Partial cancellation quantity exceeds fulfillment item reserved quantity. Requested cancellation: %, reserved: %',
+            p_quantity,
+            v_item.reserved_quantity
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    v_previous_status_code := v_order.status_code;
+
+    v_new_reservation_quantity :=
+        v_reservation.quantity - p_quantity;
+
+    /*
+     * Delegate reservation-balance adjustment to inventory.
+     *
+     * Example:
+     * reservation quantity 5
+     * cancel quantity      2
+     * new reservation      3
+     */
+    v_adjusted_reservation :=
+        inventory.adjust_reservation(
+            p_reservation_id       => p_reservation_id,
+            p_new_quantity         => v_new_reservation_quantity,
+            p_performed_by_user_id => p_performed_by_user_id,
+            p_reason               => p_reason,
+            p_metadata             =>
+                COALESCE(p_metadata, '{}'::jsonb)
+                ||
+                jsonb_build_object(
+                    'operation',
+                    'partial_fulfillment_cancellation',
+                    'cancelled_quantity',
+                    p_quantity,
+                    'fulfillment_order_id',
+                    v_order.fulfillment_order_id,
+                    'fulfillment_order_item_id',
+                    v_item.fulfillment_order_item_id
+                )
+        );
+
+    /*
+     * Move cancelled quantity out of the fulfillment reserved balance.
+     */
+    UPDATE fulfillment.fulfillment_order_items
+    SET
+        reserved_quantity =
+            reserved_quantity - p_quantity,
+        cancelled_quantity =
+            cancelled_quantity + p_quantity,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_item_id =
+          v_item.fulfillment_order_item_id
+    RETURNING *
+    INTO v_updated_item;
+
+    /*
+     * Recalculate parent fulfillment state.
+     *
+     * required = requested - cancelled
+     */
+    SELECT
+        COALESCE(
+            SUM(requested_quantity - cancelled_quantity),
+            0
+        ),
+        COALESCE(SUM(reserved_quantity), 0),
+        COALESCE(SUM(picked_quantity), 0),
+        COALESCE(SUM(packed_quantity), 0),
+        COALESCE(SUM(shipped_quantity), 0)
+    INTO
+        v_total_required,
+        v_total_reserved,
+        v_total_picked,
+        v_total_packed,
+        v_total_shipped
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id;
+
+    IF v_total_required = 0 THEN
+        v_new_status_code := 'cancelled';
+
+    ELSIF v_total_shipped >= v_total_required THEN
+        v_new_status_code := 'shipped';
+
+    ELSIF v_total_shipped > 0 THEN
+        v_new_status_code := 'partially_shipped';
+
+    ELSIF v_total_packed >= v_total_required THEN
+        v_new_status_code := 'packed';
+
+    ELSIF v_total_packed > 0 THEN
+        v_new_status_code := 'partially_packed';
+
+    ELSIF v_total_picked >= v_total_required THEN
+        v_new_status_code := 'picked';
+
+    ELSIF v_total_picked > 0 THEN
+        v_new_status_code := 'partially_picked';
+
+    ELSIF v_total_reserved >= v_total_required THEN
+        v_new_status_code := 'reserved';
+
+    ELSIF v_total_reserved > 0 THEN
+        v_new_status_code := 'partially_reserved';
+
+    ELSE
+        v_new_status_code := 'pending';
+    END IF;
+
+    UPDATE fulfillment.fulfillment_orders
+    SET
+        status_code = v_new_status_code,
+        cancelled_at =
+            CASE
+                WHEN v_new_status_code = 'cancelled'
+                    THEN CURRENT_TIMESTAMP
+                ELSE NULL
+            END,
+        completed_at =
+            CASE
+                WHEN v_new_status_code = 'shipped'
+                    THEN CURRENT_TIMESTAMP
+                ELSE NULL
+            END,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id
+    RETURNING *
+    INTO v_order;
+
+    /*
+     * Append immutable fulfillment event.
+     */
+    INSERT INTO fulfillment.fulfillment_events (
+        organization_id,
+        fulfillment_order_id,
+        fulfillment_order_item_id,
+        reservation_id,
+        event_type,
+        previous_status_code,
+        new_status_code,
+        previous_quantity,
+        new_quantity,
+        reason,
+        metadata,
+        performed_by_user_id
+    )
+    VALUES (
+        v_order.organization_id,
+        v_order.fulfillment_order_id,
+        v_item.fulfillment_order_item_id,
+        v_adjusted_reservation.reservation_id,
+        'partially_cancelled',
+        v_previous_status_code,
+        v_new_status_code,
+        v_item.cancelled_quantity,
+        v_updated_item.cancelled_quantity,
+        p_reason,
+        COALESCE(p_metadata, '{}'::jsonb)
+        ||
+        jsonb_build_object(
+            'cancelled_quantity',
+                p_quantity,
+            'previous_reservation_quantity',
+                v_reservation.quantity,
+            'new_reservation_quantity',
+                v_adjusted_reservation.quantity,
+            'remaining_reserved_quantity',
+                v_updated_item.reserved_quantity
+        ),
+        p_performed_by_user_id
+    );
+
+    RETURN v_updated_item;
+END;
+$function$;
+---------------------------------------------------------------
+---------
+---------------------------------------------------------------
