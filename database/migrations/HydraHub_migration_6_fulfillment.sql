@@ -3261,5 +3261,354 @@ BEGIN
 END;
 $function$;
 ---------------------------------------------------------------
----------
+---------fulfillment.release_fulfillment_order_item()
 ---------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fulfillment.release_fulfillment_order_item(
+    p_reservation_id bigint,
+    p_performed_by_user_id integer DEFAULT NULL,
+    p_reason text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL
+)
+RETURNS fulfillment.fulfillment_order_items
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_reservation inventory.reservations%ROWTYPE;
+    v_released_reservation inventory.reservations%ROWTYPE;
+
+    v_order fulfillment.fulfillment_orders%ROWTYPE;
+    v_item fulfillment.fulfillment_order_items%ROWTYPE;
+    v_updated_item fulfillment.fulfillment_order_items%ROWTYPE;
+
+    v_previous_status_code varchar(30);
+    v_new_status_code varchar(30);
+
+    v_total_required bigint;
+    v_total_reserved bigint;
+    v_total_picked bigint;
+    v_total_packed bigint;
+    v_total_shipped bigint;
+BEGIN
+    /*
+     * Validate parameters.
+     */
+    IF p_reservation_id IS NULL THEN
+        RAISE EXCEPTION
+            'reservation_id is required'
+            USING ERRCODE = '22004';
+    END IF;
+
+    IF p_reservation_id <= 0 THEN
+        RAISE EXCEPTION
+            'reservation_id must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_reason IS NOT NULL
+       AND btrim(p_reason) = '' THEN
+        RAISE EXCEPTION
+            'reason cannot be blank when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF p_metadata IS NOT NULL
+       AND jsonb_typeof(p_metadata) <> 'object' THEN
+        RAISE EXCEPTION
+            'metadata must be a JSON object when supplied'
+            USING ERRCODE = '22023';
+    END IF;
+
+    /*
+     * Lock the reservation.
+     */
+    SELECT *
+    INTO v_reservation
+    FROM inventory.reservations
+    WHERE reservation_id = p_reservation_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Reservation % does not exist',
+            p_reservation_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    IF v_reservation.status_code <> 'active' THEN
+        RAISE EXCEPTION
+            'Reservation % cannot be released from fulfillment because its current status is %',
+            p_reservation_id,
+            v_reservation.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF v_reservation.source_type_code <> 'fulfillment_order' THEN
+        RAISE EXCEPTION
+            'Reservation % is not associated with a fulfillment order',
+            p_reservation_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock the parent fulfillment order.
+     */
+    SELECT *
+    INTO v_order
+    FROM fulfillment.fulfillment_orders
+    WHERE fulfillment_order_id =
+          v_reservation.source_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment order % does not exist',
+            v_reservation.source_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Inventory may be released only before warehouse
+     * processing has progressed into picking.
+     */
+    IF v_order.status_code NOT IN (
+        'partially_reserved',
+        'reserved'
+    ) THEN
+        RAISE EXCEPTION
+            'Fulfillment order % cannot release inventory because its current status is %',
+            v_order.fulfillment_order_id,
+            v_order.status_code
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Lock the fulfillment item.
+     */
+    SELECT *
+    INTO v_item
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_item_id =
+          v_reservation.source_line_id
+      AND fulfillment_order_id =
+          v_order.fulfillment_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % does not exist on fulfillment order %',
+            v_reservation.source_line_id,
+            v_order.fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Once picking begins, the physical item may already
+     * have left its normal inventory location.
+     */
+    IF v_item.picked_quantity > 0
+       OR v_item.packed_quantity > 0
+       OR v_item.shipped_quantity > 0 THEN
+        RAISE EXCEPTION
+            'Fulfillment-order item % cannot release inventory because warehouse processing has already begun',
+            v_item.fulfillment_order_item_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * Fulfillment and inventory must agree before mutation.
+     */
+    IF v_reservation.quantity > v_item.reserved_quantity THEN
+        RAISE EXCEPTION
+            'Reservation % quantity exceeds fulfillment item reserved quantity. Reservation: %, fulfillment reserved: %',
+            p_reservation_id,
+            v_reservation.quantity,
+            v_item.reserved_quantity
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    v_previous_status_code :=
+        v_order.status_code;
+
+    /*
+     * Delegate inventory ownership to the inventory engine.
+     *
+     * This changes:
+     *
+     * reservation: active -> released
+     * warehouse quantity_reserved decreases
+     *
+     * quantity_on_hand is NOT consumed.
+     */
+    v_released_reservation :=
+        inventory.release_reservation(
+            p_reservation_id       => p_reservation_id,
+            p_performed_by_user_id => p_performed_by_user_id,
+            p_reason               => p_reason,
+            p_metadata             =>
+                COALESCE(p_metadata, '{}'::jsonb)
+                ||
+                jsonb_build_object(
+                    'operation',
+                    'fulfillment_inventory_release',
+                    'fulfillment_order_id',
+                    v_order.fulfillment_order_id,
+                    'fulfillment_order_item_id',
+                    v_item.fulfillment_order_item_id
+                )
+        );
+
+    /*
+     * Remove the released quantity from fulfillment's
+     * current reserved balance.
+     *
+     * IMPORTANT:
+     * cancelled_quantity does NOT change.
+     *
+     * Release means the inventory hold is gone.
+     * It does not mean the customer's requirement is cancelled.
+     */
+    UPDATE fulfillment.fulfillment_order_items
+    SET
+        reserved_quantity =
+            reserved_quantity - v_reservation.quantity,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_item_id =
+          v_item.fulfillment_order_item_id
+    RETURNING *
+    INTO v_updated_item;
+
+    /*
+     * Recalculate the parent fulfillment status.
+     *
+     * Unlike cancellation:
+     *
+     * required = requested - cancelled
+     *
+     * Released inventory remains part of the required quantity.
+     */
+    SELECT
+        COALESCE(
+            SUM(requested_quantity - cancelled_quantity),
+            0
+        ),
+        COALESCE(SUM(reserved_quantity), 0),
+        COALESCE(SUM(picked_quantity), 0),
+        COALESCE(SUM(packed_quantity), 0),
+        COALESCE(SUM(shipped_quantity), 0)
+    INTO
+        v_total_required,
+        v_total_reserved,
+        v_total_picked,
+        v_total_packed,
+        v_total_shipped
+    FROM fulfillment.fulfillment_order_items
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id;
+
+    IF v_total_required = 0 THEN
+        v_new_status_code := 'cancelled';
+
+    ELSIF v_total_shipped >= v_total_required THEN
+        v_new_status_code := 'shipped';
+
+    ELSIF v_total_shipped > 0 THEN
+        v_new_status_code := 'partially_shipped';
+
+    ELSIF v_total_packed >= v_total_required THEN
+        v_new_status_code := 'packed';
+
+    ELSIF v_total_packed > 0 THEN
+        v_new_status_code := 'partially_packed';
+
+    ELSIF v_total_picked >= v_total_required THEN
+        v_new_status_code := 'picked';
+
+    ELSIF v_total_picked > 0 THEN
+        v_new_status_code := 'partially_picked';
+
+    ELSIF v_total_reserved >= v_total_required THEN
+        v_new_status_code := 'reserved';
+
+    ELSIF v_total_reserved > 0 THEN
+        v_new_status_code := 'partially_reserved';
+
+    ELSE
+        v_new_status_code := 'pending';
+    END IF;
+
+    /*
+     * Synchronize the parent fulfillment order.
+     */
+    UPDATE fulfillment.fulfillment_orders
+    SET
+        status_code = v_new_status_code,
+
+        completed_at =
+            CASE
+                WHEN v_new_status_code = 'shipped'
+                    THEN CURRENT_TIMESTAMP
+                ELSE NULL
+            END,
+
+        cancelled_at =
+            CASE
+                WHEN v_new_status_code = 'cancelled'
+                    THEN CURRENT_TIMESTAMP
+                ELSE NULL
+            END,
+
+        updated_at = CURRENT_TIMESTAMP
+    WHERE fulfillment_order_id =
+          v_order.fulfillment_order_id
+    RETURNING *
+    INTO v_order;
+
+    /*
+     * Append immutable fulfillment audit event.
+     */
+    INSERT INTO fulfillment.fulfillment_events (
+        organization_id,
+        fulfillment_order_id,
+        fulfillment_order_item_id,
+        reservation_id,
+        event_type,
+        previous_status_code,
+        new_status_code,
+        previous_quantity,
+        new_quantity,
+        reason,
+        metadata,
+        performed_by_user_id
+    )
+    VALUES (
+        v_order.organization_id,
+        v_order.fulfillment_order_id,
+        v_item.fulfillment_order_item_id,
+        v_released_reservation.reservation_id,
+        'released',
+        v_previous_status_code,
+        v_new_status_code,
+        v_item.reserved_quantity,
+        v_updated_item.reserved_quantity,
+        p_reason,
+        COALESCE(p_metadata, '{}'::jsonb)
+        ||
+        jsonb_build_object(
+            'released_quantity',
+                v_reservation.quantity,
+            'previous_reserved_quantity',
+                v_item.reserved_quantity,
+            'new_reserved_quantity',
+                v_updated_item.reserved_quantity,
+            'reservation_status',
+                v_released_reservation.status_code
+        ),
+        p_performed_by_user_id
+    );
+
+    RETURN v_updated_item;
+END;
+$function$;
+--------------------------------------------------------------------
+--------------
+--------------------------------------------------------------------
