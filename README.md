@@ -165,6 +165,6 @@ any medium, is strictly prohibited.
 The project is being built as both a functional software platform and a long-term software engineering project focused on database architecture, backend development, systems integration, application development, and deployment.
 
 
-![typescript](https://img.shields.io/badge/typeScript-darkgreen.svg)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-darkgreen)](https://www.postgresql.org/)
-![CPP](https://img.shields.io/badge/Cpp-darkgreen.svg)
+![typescript](https://img.shields.io/badge/typeScript-grey.svg)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-grey)](https://www.postgresql.org/)
+![CPP](https://img.shields.io/badge/Cpp-grey.svg)
