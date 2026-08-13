@@ -1,15 +1,15 @@
 # HydraHub
 
-HydHydraHub is a modular business operations platform designed to provide acentralized system for managing products, inventory, orders, fulfillment, services, scheduling, and other day-to-day business operations.
+HydraHub is a modular business operations platform designed to provide acentralized system for managing products, inventory, orders, fulfillment, services, scheduling, and other day-to-day business operations.
 
 The goal of HydraHub is to create a flexible backend platform that cansupport multiple types of businesses and multiple front-facing applications from a shared system.
 
-Rather than being limited to inventory management, HydraHub is designedto support businesses that sell physical products, provide services, oroperate using a combination of both. HydraHub is an enterprise inventory management system designed to provide centralized tracking and management of products, categories, stock levels, suppliers, and inventory transactions.
+Rather than being limited to inventory management, HydraHub is designedto support businesses that sell physical products, provide services, or operate using a combination of both. HydraHub is an enterprise inventory management system designed to provide centralized tracking and management of products, categories, stock levels, services,suppliers, and inventory transactions.
 
 
 ## Overview
 
-The goal of HydraHub is to serve as a scalable inventory HydraHub provides a common platform for managing the operational dataand workflows used by a business.
+The goal of HydraHub is to serve as a scalable inventory HydraHub provides a common platform for managing the operational data and workflows used by a business.
 
 The platform is designed around independent but connected business domains, allowing new capabilities to be added without requiring the entire system to be redesigned. a inventory / service  platform with multiple front facing applications capable of supporting multiple inventory types, including:
 ## Core Areas
@@ -45,7 +45,7 @@ HydraHub is also designed to support businesses that provide services.
 Services can be represented independently from physical inventory and integrated with scheduling, service orders, pricing, and service lifecycle management.
 
 ### Returns
-Physical products can move through return workflows that determine how returned inventory should be recorded, inspected, restocked, orotherwise handled.
+Physical products can move through return workflows that determine how returned inventory should be recorded, inspected, restocked, or otherwise handled.
 
 ### Multi-Application Support
 
@@ -119,7 +119,7 @@ HydraHub is being designed around several long-term goals:
 
 ## Project Goals
 
-HydraHub is being developed incrementally, beginning with the coredatabase and business domains before expanding into the API and client application layers.
+HydraHub is being developed incrementally, beginning with the core database and business domains before expanding into the API and client application layers.
 
 The long-term platform direction is:
 ```
@@ -150,7 +150,7 @@ Diagnostics & Monitoring
 Deployment Infrastructure
 
 ```
-individual implementation details, database migrations, architecturedecisions, API specifications, and testing procedures are maintained separately in the project documentation.
+individual implementation details, database migrations, architecture decisions, API specifications, and testing procedures are maintained separately in the project documentation.
 
 ---
 
