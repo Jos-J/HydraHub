@@ -11,7 +11,7 @@ Rather than being limited to inventory management, HydraHub is designedto suppor
 
 The goal of HydraHub is to serve as a scalable inventory HydraHub provides a common platform for managing the operational dataand workflows used by a business.
 
-The platform is designed around independent but connected businessdomains, allowing new capabilities to be added without requiring the entire system to be redesigned. a inventory / service  platform with multiple front facing applications capable of supporting multiple inventory types, including:
+The platform is designed around independent but connected business domains, allowing new capabilities to be added without requiring the entire system to be redesigned. a inventory / service  platform with multiple front facing applications capable of supporting multiple inventory types, including:
 ## Core Areas
 - Product and Catalog Management
 - Inventory Management
@@ -35,14 +35,14 @@ HydraHub is intended to serve as the backend foundation for multiple application
 ### Products & Inventory
 
 HydraHub is designed to manage physical products across one or moreinventory locations.
-This includes product catalogs, variants, SKUs, warehouse inventory,inventory availability, reservations, and inventory movement.
+This includes product catalogs, variants, SKUs, warehouse inventory, inventory availability, reservations, and inventory movement.
 
 ### Sales & Fulfillment
 Sales orders can be connected to inventory and fulfillment workflows responsible for reserving, preparing, shipping, and completing customerorders.
 
 ### Services & Scheduling
 HydraHub is also designed to support businesses that provide services.
-Services can be represented independently from physical inventory andintegrated with scheduling, service orders, pricing, and service lifecycle management.
+Services can be represented independently from physical inventory and integrated with scheduling, service orders, pricing, and service lifecycle management.
 
 ### Returns
 Physical products can move through return workflows that determine how returned inventory should be recorded, inspected, restocked, orotherwise handled.
@@ -119,7 +119,7 @@ HydraHub is being designed around several long-term goals:
 
 ## Project Goals
 
-HydraHub is being developed incrementally, beginning with the coredatabase and business domains before expanding into the API and clientapplication layers.
+HydraHub is being developed incrementally, beginning with the coredatabase and business domains before expanding into the API and client application layers.
 
 The long-term platform direction is:
 ```
@@ -150,7 +150,7 @@ Diagnostics & Monitoring
 Deployment Infrastructure
 
 ```
-individual implementation details, database migrations, architecturedecisions, API specifications, and testing procedures are maintainedseparately in the project documentation.
+individual implementation details, database migrations, architecturedecisions, API specifications, and testing procedures are maintained separately in the project documentation.
 
 ---
 
@@ -162,8 +162,9 @@ This repository and its source code are proprietary and confidential. Unauthoriz
 copying, modification, distribution, or commercial use of this software, via
 any medium, is strictly prohibited.
 
-The project is being built as both a functional software platform and along-term software engineering project focused on database architecture,backend development, systems integration, application development, anddeployment.
+The project is being built as both a functional software platform and a long-term software engineering project focused on database architecture, backend development, systems integration, application development, and deployment.
 
 
-<!-- --![MIT License](https://img.shields.io/badge/License-MIT-darkgreen.svg) -->
+![typescript](https://img.shields.io/badge/typeScript-darkgreen.svg)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-darkgreen)](https://www.postgresql.org/)
+![CPP](https://img.shields.io/badge/Cpp-darkgreen.svg)
