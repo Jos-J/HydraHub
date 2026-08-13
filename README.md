@@ -1,8 +1,8 @@
 # HydraHub
 
-HydHydraHub is a modular business operations platform designed to provide acentralized system for managing products, inventory, orders,fulfillment, services, scheduling, and other day-to-day businessoperations.
+HydHydraHub is a modular business operations platform designed to provide acentralized system for managing products, inventory, orders, fulfillment, services, scheduling, and other day-to-day business operations.
 
-The goal of HydraHub is to create a flexible backend platform that cansupport multiple types of businesses and multiple front-facingapplications from a shared system.
+The goal of HydraHub is to create a flexible backend platform that cansupport multiple types of businesses and multiple front-facing applications from a shared system.
 
 Rather than being limited to inventory management, HydraHub is designedto support businesses that sell physical products, provide services, oroperate using a combination of both. HydraHub is an enterprise inventory management system designed to provide centralized tracking and management of products, categories, stock levels, suppliers, and inventory transactions.
 
