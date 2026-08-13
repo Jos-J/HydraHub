@@ -156,11 +156,14 @@ individual implementation details, database migrations, architecturedecisions, A
 
 ## License & Status
 
-This project is currently under active development and is intended for educational and portfolio purposes.
-HydraHub is currently under active development.
+ &copy; 2026 Jos J Portfolio. All rights reserved.
+
+This repository and its source code are proprietary and confidential. Unauthorized
+copying, modification, distribution, or commercial use of this software, via
+any medium, is strictly prohibited.
 
 The project is being built as both a functional software platform and along-term software engineering project focused on database architecture,backend development, systems integration, application development, anddeployment.
 
 
-![MIT License](https://img.shields.io/badge/License-MIT-darkgreen.svg)
+<!-- --![MIT License](https://img.shields.io/badge/License-MIT-darkgreen.svg) -->
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-darkgreen)](https://www.postgresql.org/)
