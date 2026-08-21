@@ -134,3 +134,26 @@ ADD CONSTRAINT fk_employee_services_org_service
 	ALTER TABLE services.services
 ADD CONSTRAINT uq_services_org_service
     UNIQUE (organization_id, service_id);
+
+	ALTER TABLE services.employee_services
+ADD CONSTRAINT fk_employee_services_org_user
+    FOREIGN KEY (organization_id, user_id)
+    REFERENCES public.organization_users (
+        organization_id,
+        user_id
+    );
+
+	ALTER TABLE public.invoices
+DROP CONSTRAINT invoices_booking_id_fkey;
+
+ALTER TABLE public.quotes
+DROP CONSTRAINT quotes_booking_id_fkey;
+
+ALTER TABLE public.bookings
+DROP CONSTRAINT bookings_package_id_fkey;
+
+ALTER TABLE public.invoice_items
+DROP CONSTRAINT invoice_items_service_id_fkey;
+
+ALTER TABLE public.quote_items
+DROP CONSTRAINT quote_items_service_id_fkey;
