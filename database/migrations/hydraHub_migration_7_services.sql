@@ -546,6 +546,290 @@ ON services.appointments
 FOR EACH ROW
 EXECUTE FUNCTION services.validate_appointment_availability();
 
+----------------------------------------------------------------
+-------------- services.appointment_events
+----------------------------------------------------------------
+CREATE TABLE services.appointment_events (
+    appointment_event_id BIGSERIAL PRIMARY KEY,
+
+    organization_id INTEGER NOT NULL,
+    appointment_id BIGINT NOT NULL,
+
+    event_type VARCHAR(50) NOT NULL,
+
+    old_start_at TIMESTAMPTZ,
+    old_end_at TIMESTAMPTZ,
+
+    new_start_at TIMESTAMPTZ,
+    new_end_at TIMESTAMPTZ,
+
+    changed_by_user_id INTEGER,
+    reason TEXT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT chk_appointment_events_type
+        CHECK (
+            event_type IN (
+                'scheduled',
+                'rescheduled',
+                'started',
+                'completed',
+                'cancelled',
+                'no_show'
+            )
+        ),
+
+    CONSTRAINT fk_appointment_events_appointment
+        FOREIGN KEY (appointment_id)
+        REFERENCES services.appointments(appointment_id),
+
+    CONSTRAINT fk_appointment_events_changed_by
+        FOREIGN KEY (changed_by_user_id)
+        REFERENCES public.users(user_id)
+);
+---------------------------------------------------------------
+--------------services.rescheduled_appointment function
+--------------------------------------------------------------
+CREATE OR REPLACE FUNCTION services.reschedule_appointment(
+    p_organization_id INTEGER,
+    p_appointment_id BIGINT,
+    p_new_start_at TIMESTAMPTZ,
+    p_new_end_at TIMESTAMPTZ,
+    p_changed_by_user_id INTEGER,
+    p_initiated_by VARCHAR,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_old_start_at TIMESTAMPTZ;
+    v_old_end_at TIMESTAMPTZ;
+    v_status_code VARCHAR;
+BEGIN
+    IF p_initiated_by NOT IN (
+        'customer',
+        'employee',
+        'manager',
+        'system'
+    ) THEN
+        RAISE EXCEPTION
+            'Invalid initiated_by value: %',
+            p_initiated_by;
+    END IF;
+
+    SELECT
+        a.start_at,
+        a.end_at,
+        s.status_code
+    INTO
+        v_old_start_at,
+        v_old_end_at,
+        v_status_code
+    FROM services.appointments a
+    JOIN services.appointment_statuses s
+        ON s.appointment_status_id = a.appointment_status_id
+    WHERE a.organization_id = p_organization_id
+      AND a.appointment_id = p_appointment_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Appointment % not found for organization %',
+            p_appointment_id,
+            p_organization_id;
+    END IF;
+
+    IF v_status_code <> 'scheduled' THEN
+        RAISE EXCEPTION
+            'Only scheduled appointments may be rescheduled. Current status: %',
+            v_status_code;
+    END IF;
+
+    UPDATE services.appointments
+    SET
+        start_at = p_new_start_at,
+        end_at = p_new_end_at,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE organization_id = p_organization_id
+      AND appointment_id = p_appointment_id;
+
+    INSERT INTO services.appointment_events (
+        organization_id,
+        appointment_id,
+        event_type,
+        old_start_at,
+        old_end_at,
+        new_start_at,
+        new_end_at,
+        changed_by_user_id,
+        initiated_by,
+        reason
+    )
+    VALUES (
+        p_organization_id,
+        p_appointment_id,
+        'rescheduled',
+        v_old_start_at,
+        v_old_end_at,
+        p_new_start_at,
+        p_new_end_at,
+        p_changed_by_user_id,
+        p_initiated_by,
+        p_reason
+    );
+END;
+$$;
+-------------------------------------------------------------
+-----------------services.change_appointment_status_function
+-------------------------------------------------------------
+CREATE OR REPLACE FUNCTION services.change_appointment_status(
+    p_organization_id INTEGER,
+    p_appointment_id BIGINT,
+    p_new_status_code VARCHAR,
+    p_changed_by_user_id INTEGER,
+    p_initiated_by VARCHAR,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_old_status_code VARCHAR;
+    v_new_status_id BIGINT;
+    v_event_type VARCHAR;
+BEGIN
+    IF p_initiated_by NOT IN (
+        'customer',
+        'employee',
+        'manager',
+        'system'
+    ) THEN
+        RAISE EXCEPTION
+            'Invalid initiated_by value: %',
+            p_initiated_by;
+    END IF;
+
+    SELECT
+        s.status_code
+    INTO
+        v_old_status_code
+    FROM services.appointments a
+    JOIN services.appointment_statuses s
+        ON s.appointment_status_id = a.appointment_status_id
+    WHERE a.organization_id = p_organization_id
+      AND a.appointment_id = p_appointment_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Appointment % not found for organization %',
+            p_appointment_id,
+            p_organization_id;
+    END IF;
+
+    SELECT appointment_status_id
+    INTO v_new_status_id
+    FROM services.appointment_statuses
+    WHERE status_code = p_new_status_code;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Invalid appointment status code: %',
+            p_new_status_code;
+    END IF;
+
+    IF NOT (
+        (v_old_status_code = 'scheduled'
+            AND p_new_status_code IN ('in_progress', 'cancelled', 'no_show'))
+        OR
+        (v_old_status_code = 'in_progress'
+            AND p_new_status_code IN ('completed', 'cancelled'))
+    ) THEN
+        RAISE EXCEPTION
+            'Invalid appointment status transition: % -> %',
+            v_old_status_code,
+            p_new_status_code;
+    END IF;
+
+    PERFORM set_config(
+        'services.allow_appointment_status_change',
+        'on',
+        true
+    );
+
+    UPDATE services.appointments
+    SET
+        appointment_status_id = v_new_status_id,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE organization_id = p_organization_id
+      AND appointment_id = p_appointment_id;
+
+    PERFORM set_config(
+        'services.allow_appointment_status_change',
+        'off',
+        true
+    );
+
+    v_event_type :=
+        CASE
+            WHEN p_new_status_code = 'in_progress' THEN 'started'
+            ELSE p_new_status_code
+        END;
+
+    INSERT INTO services.appointment_events (
+        organization_id,
+        appointment_id,
+        event_type,
+        changed_by_user_id,
+        initiated_by,
+        reason
+    )
+    VALUES (
+        p_organization_id,
+        p_appointment_id,
+        v_event_type,
+        p_changed_by_user_id,
+        p_initiated_by,
+        p_reason
+    );
+END;
+$$;
+----------------------------------------------------------------------
+-----------------------
+----------------------------------------------------------------------
+
+
+-----------------------------------------------------------------------
+---------------------services.guard_appointment_status_update function 
+-----------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION services.guard_appointment_status_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.appointment_status_id IS DISTINCT FROM OLD.appointment_status_id THEN
+        IF current_setting(
+            'services.allow_appointment_status_change',
+            true
+        ) IS DISTINCT FROM 'on' THEN
+            RAISE EXCEPTION
+                'Appointment status must be changed through services.change_appointment_status()';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+--------------------------------------------------------------
+------------------trg_guard_appointment_status_update-trigger
+--------------------------------------------------------------
+CREATE TRIGGER trg_guard_appointment_status_update
+BEFORE UPDATE OF appointment_status_id
+ON services.appointments
+FOR EACH ROW
+EXECUTE FUNCTION services.guard_appointment_status_update();
 
 ---------------------------------------------------------------
 ---------------extension
