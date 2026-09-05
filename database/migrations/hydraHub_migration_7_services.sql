@@ -950,6 +950,303 @@ BEGIN
     );
 END;
 $$;
+--------------------------------------------------------------
+-----------------------service.cancel_service function 
+-------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION services.cancel_service(
+    p_organization_id INTEGER,
+    p_appointment_id BIGINT,
+    p_service_order_item_id BIGINT,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_item_status VARCHAR;
+    v_cancelled_status_id BIGINT;
+BEGIN
+    /*
+     * 1. Verify the item is attached to the appointment
+     *    and lock the service-order item.
+     */
+    SELECT
+        sois.status_code
+    INTO
+        v_item_status
+    FROM services.appointment_items ai
+    JOIN services.service_order_items soi
+        ON soi.organization_id = ai.organization_id
+       AND soi.service_order_id = ai.service_order_id
+       AND soi.service_order_item_id = ai.service_order_item_id
+    JOIN services.service_order_item_statuses sois
+        ON sois.service_order_item_status_id =
+           soi.service_order_item_status_id
+    WHERE ai.organization_id = p_organization_id
+      AND ai.appointment_id = p_appointment_id
+      AND ai.service_order_item_id = p_service_order_item_id
+    FOR UPDATE OF soi;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service order item % is not attached to appointment %',
+            p_service_order_item_id,
+            p_appointment_id;
+    END IF;
+
+    /*
+     * 2. Only active/uncompleted service states may be cancelled.
+     */
+    IF v_item_status NOT IN ('pending', 'scheduled', 'in_progress') THEN
+        RAISE EXCEPTION
+            'Service order item % cannot be cancelled from status %',
+            p_service_order_item_id,
+            v_item_status;
+    END IF;
+
+    /*
+     * 3. Get the cancelled status ID.
+     */
+    SELECT service_order_item_status_id
+    INTO v_cancelled_status_id
+    FROM services.service_order_item_statuses
+    WHERE status_code = 'cancelled';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service-order-item status cancelled does not exist';
+    END IF;
+
+    /*
+     * 4. Cancel the service.
+     */
+    UPDATE services.service_order_items
+    SET
+        service_order_item_status_id = v_cancelled_status_id,
+        cancelled_at = CURRENT_TIMESTAMP,
+        cancellation_reason = p_reason,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE organization_id = p_organization_id
+      AND service_order_item_id = p_service_order_item_id;
+END;
+$$;
+--------------------------------------------------------------
+--------services.cancel_service_order function 
+--------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION services.cancel_service_order(
+    p_organization_id INTEGER,
+    p_service_order_id BIGINT,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_order_status VARCHAR;
+    v_cancelled_order_status_id BIGINT;
+    v_cancelled_item_status_id BIGINT;
+BEGIN
+    /*
+     * 1. Lock and validate the service order.
+     */
+    SELECT sos.status_code
+    INTO v_order_status
+    FROM services.service_orders so
+    JOIN services.service_order_statuses sos
+      ON sos.service_order_status_id = so.service_order_status_id
+    WHERE so.organization_id = p_organization_id
+      AND so.service_order_id = p_service_order_id
+    FOR UPDATE OF so;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service order % not found for organization %',
+            p_service_order_id,
+            p_organization_id;
+    END IF;
+
+    /*
+     * 2. Reject terminal order states.
+     */
+    IF v_order_status IN ('completed', 'cancelled') THEN
+        RAISE EXCEPTION
+            'Service order % cannot be cancelled from status %',
+            p_service_order_id,
+            v_order_status;
+    END IF;
+
+    /*
+     * 3. A completed child service blocks whole-order cancellation.
+     */
+    IF EXISTS (
+        SELECT 1
+        FROM services.service_order_items soi
+        JOIN services.service_order_item_statuses sois
+          ON sois.service_order_item_status_id =
+             soi.service_order_item_status_id
+        WHERE soi.organization_id = p_organization_id
+          AND soi.service_order_id = p_service_order_id
+          AND sois.status_code = 'completed'
+    ) THEN
+        RAISE EXCEPTION
+            'Service order % cannot be cancelled because it contains a completed service item',
+            p_service_order_id;
+    END IF;
+
+    /*
+     * 4. Get cancelled status IDs.
+     */
+    SELECT service_order_status_id
+    INTO v_cancelled_order_status_id
+    FROM services.service_order_statuses
+    WHERE status_code = 'cancelled';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service-order status cancelled does not exist';
+    END IF;
+
+    SELECT service_order_item_status_id
+    INTO v_cancelled_item_status_id
+    FROM services.service_order_item_statuses
+    WHERE status_code = 'cancelled';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service-order-item status cancelled does not exist';
+    END IF;
+
+    /*
+     * 5. Cancel all remaining active service items.
+     */
+    UPDATE services.service_order_items soi
+    SET
+        service_order_item_status_id = v_cancelled_item_status_id,
+        cancelled_at = CURRENT_TIMESTAMP,
+        cancellation_reason = p_reason,
+        updated_at = CURRENT_TIMESTAMP
+    FROM services.service_order_item_statuses sois
+    WHERE sois.service_order_item_status_id =
+          soi.service_order_item_status_id
+      AND soi.organization_id = p_organization_id
+      AND soi.service_order_id = p_service_order_id
+      AND sois.status_code IN ('pending', 'scheduled', 'in_progress');
+
+    /*
+     * 6. Cancel the parent service order.
+     */
+    UPDATE services.service_orders
+    SET
+        service_order_status_id = v_cancelled_order_status_id,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE organization_id = p_organization_id
+      AND service_order_id = p_service_order_id;
+END;
+$$;
+
+--------------------------------------------------------------
+-----------services.mark_no_show
+--------------------------------------------------------------
+CREATE OR REPLACE FUNCTION services.mark_no_show(
+    p_organization_id INTEGER,
+    p_appointment_id BIGINT,
+    p_changed_by_user_id INTEGER,
+    p_initiated_by VARCHAR,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_appointment_status VARCHAR;
+    v_no_show_appointment_status_id BIGINT;
+    v_no_show_item_status_id BIGINT;
+BEGIN
+    /*
+     * 1. Lock and validate the appointment.
+     */
+    SELECT aps.status_code
+    INTO v_appointment_status
+    FROM services.appointments a
+    JOIN services.appointment_statuses aps
+      ON aps.appointment_status_id = a.appointment_status_id
+    WHERE a.organization_id = p_organization_id
+      AND a.appointment_id = p_appointment_id
+    FOR UPDATE OF a;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Appointment % not found for organization %',
+            p_appointment_id,
+            p_organization_id;
+    END IF;
+
+    /*
+     * 2. Only scheduled appointments can become no-show.
+     */
+    IF v_appointment_status <> 'scheduled' THEN
+        RAISE EXCEPTION
+            'Appointment % cannot be marked no-show from status %',
+            p_appointment_id,
+            v_appointment_status;
+    END IF;
+
+    /*
+     * 3. Get no-show status IDs.
+     */
+    SELECT appointment_status_id
+    INTO v_no_show_appointment_status_id
+    FROM services.appointment_statuses
+    WHERE status_code = 'no_show';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Appointment status no_show does not exist';
+    END IF;
+
+    SELECT service_order_item_status_id
+    INTO v_no_show_item_status_id
+    FROM services.service_order_item_statuses
+    WHERE status_code = 'no_show';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service-order-item status no_show does not exist';
+    END IF;
+
+    /*
+     * 4. Mark eligible attached service items as no-show.
+     */
+    UPDATE services.service_order_items soi
+    SET
+        service_order_item_status_id = v_no_show_item_status_id,
+        no_show_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    FROM services.appointment_items ai,
+         services.service_order_item_statuses sois
+    WHERE ai.organization_id = p_organization_id
+      AND ai.appointment_id = p_appointment_id
+      AND ai.service_order_item_id = soi.service_order_item_id
+      AND ai.organization_id = soi.organization_id
+      AND sois.service_order_item_status_id =
+          soi.service_order_item_status_id
+      AND sois.status_code IN ('pending', 'scheduled');
+
+    /*
+     * 5. Change the appointment status using the approved function.
+     */
+    PERFORM services.change_appointment_status(
+        p_organization_id,
+        p_appointment_id,
+        'no_show',
+        p_changed_by_user_id,
+        p_initiated_by,
+        p_reason
+    );
+END;
+$$;
 
 ---------------------------------------------------------------
 ----------------trg_validate_appointment-trigger
