@@ -564,7 +564,10 @@ $$;
 CREATE OR REPLACE FUNCTION services.start_service(
     p_organization_id INTEGER,
     p_appointment_id BIGINT,
-    p_service_order_item_id BIGINT
+    p_service_order_item_id BIGINT,
+    p_changed_by_user_id INTEGER,
+    p_initiated_by VARCHAR,
+    p_reason TEXT DEFAULT NULL
 )
 RETURNS VOID
 LANGUAGE plpgsql
@@ -574,11 +577,11 @@ DECLARE
     v_item_status VARCHAR;
     v_service_id BIGINT;
     v_employee_user_id INTEGER;
+    v_service_order_id BIGINT;
     v_in_progress_status_id BIGINT;
 BEGIN
     /*
-     * 1. Verify the appointment exists and get the
-     *    assigned employee + current appointment status.
+     * 1. Verify appointment and get assigned employee.
      */
     SELECT
         aps.status_code,
@@ -601,7 +604,7 @@ BEGIN
     END IF;
 
     /*
-     * 2. The appointment itself must already be started.
+     * 2. Appointment must already be in progress.
      */
     IF v_appointment_status <> 'in_progress' THEN
         RAISE EXCEPTION
@@ -611,14 +614,29 @@ BEGIN
     END IF;
 
     /*
-     * 3. Verify this service-order item is actually
-     *    attached to this appointment.
+     * 3. Validate initiated_by.
+     */
+    IF p_initiated_by NOT IN (
+        'customer',
+        'employee',
+        'manager',
+        'system'
+    ) THEN
+        RAISE EXCEPTION
+            'Invalid initiated_by value: %',
+            p_initiated_by;
+    END IF;
+
+    /*
+     * 4. Verify item belongs to this appointment.
      */
     SELECT
         soi.service_id,
+        soi.service_order_id,
         sois.status_code
     INTO
         v_service_id,
+        v_service_order_id,
         v_item_status
     FROM services.appointment_items ai
     JOIN services.service_order_items soi
@@ -641,7 +659,7 @@ BEGIN
     END IF;
 
     /*
-     * 4. Only pending or scheduled services may start.
+     * 5. Only pending or scheduled services may start.
      */
     IF v_item_status NOT IN ('pending', 'scheduled') THEN
         RAISE EXCEPTION
@@ -651,8 +669,7 @@ BEGIN
     END IF;
 
     /*
-     * 5. Verify the appointment employee is authorized
-     *    to perform this particular service.
+     * 6. Verify employee capability.
      */
     IF NOT EXISTS (
         SELECT 1
@@ -669,7 +686,7 @@ BEGIN
     END IF;
 
     /*
-     * 6. Get the in_progress status ID.
+     * 7. Get in-progress status.
      */
     SELECT service_order_item_status_id
     INTO v_in_progress_status_id
@@ -682,7 +699,7 @@ BEGIN
     END IF;
 
     /*
-     * 7. Start this individual service.
+     * 8. Start service.
      */
     UPDATE services.service_order_items
     SET
@@ -691,6 +708,28 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP
     WHERE organization_id = p_organization_id
       AND service_order_item_id = p_service_order_item_id;
+
+    /*
+     * 9. Record audit event.
+     */
+    INSERT INTO services.service_events (
+        organization_id,
+        service_order_id,
+        service_order_item_id,
+        event_type,
+        changed_by_user_id,
+        initiated_by,
+        reason
+    )
+    VALUES (
+        p_organization_id,
+        v_service_order_id,
+        p_service_order_item_id,
+        'service_started',
+        p_changed_by_user_id,
+        p_initiated_by,
+        p_reason
+    );
 END;
 $$;
 -------------------------------------------------------------
@@ -699,22 +738,42 @@ $$;
 CREATE OR REPLACE FUNCTION services.complete_service(
     p_organization_id INTEGER,
     p_appointment_id BIGINT,
-    p_service_order_item_id BIGINT
+    p_service_order_item_id BIGINT,
+    p_changed_by_user_id INTEGER,
+    p_initiated_by VARCHAR,
+    p_reason TEXT DEFAULT NULL
 )
 RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 DECLARE
     v_item_status VARCHAR;
+    v_service_order_id BIGINT;
     v_completed_status_id BIGINT;
 BEGIN
     /*
-     * 1. Verify the service item is attached
+     * 1. Validate initiated_by.
+     */
+    IF p_initiated_by NOT IN (
+        'customer',
+        'employee',
+        'manager',
+        'system'
+    ) THEN
+        RAISE EXCEPTION
+            'Invalid initiated_by value: %',
+            p_initiated_by;
+    END IF;
+
+    /*
+     * 2. Verify the service item is attached
      *    to the appointment and lock it.
      */
     SELECT
+        soi.service_order_id,
         sois.status_code
     INTO
+        v_service_order_id,
         v_item_status
     FROM services.appointment_items ai
     JOIN services.service_order_items soi
@@ -737,7 +796,7 @@ BEGIN
     END IF;
 
     /*
-     * 2. Only an in-progress service may be completed.
+     * 3. Only an in-progress service may be completed.
      */
     IF v_item_status <> 'in_progress' THEN
         RAISE EXCEPTION
@@ -747,7 +806,7 @@ BEGIN
     END IF;
 
     /*
-     * 3. Get the completed status ID.
+     * 4. Get completed status ID.
      */
     SELECT service_order_item_status_id
     INTO v_completed_status_id
@@ -760,7 +819,7 @@ BEGIN
     END IF;
 
     /*
-     * 4. Complete the service.
+     * 5. Complete the service.
      */
     UPDATE services.service_order_items
     SET
@@ -769,6 +828,28 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP
     WHERE organization_id = p_organization_id
       AND service_order_item_id = p_service_order_item_id;
+
+    /*
+     * 6. Record audit event.
+     */
+    INSERT INTO services.service_events (
+        organization_id,
+        service_order_id,
+        service_order_item_id,
+        event_type,
+        changed_by_user_id,
+        initiated_by,
+        reason
+    )
+    VALUES (
+        p_organization_id,
+        v_service_order_id,
+        p_service_order_item_id,
+        'service_completed',
+        p_changed_by_user_id,
+        p_initiated_by,
+        p_reason
+    );
 END;
 $$;
 
@@ -786,6 +867,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_service_id BIGINT;
+    v_service_order_id BIGINT;
     v_item_status VARCHAR;
     v_requirement RECORD;
     v_quantity_available INTEGER;
@@ -795,9 +877,11 @@ BEGIN
      */
     SELECT
         soi.service_id,
+        soi.service_order_id,
         sois.status_code
     INTO
         v_service_id,
+        v_service_order_id,
         v_item_status
     FROM services.service_order_items soi
     JOIN services.service_order_item_statuses sois
@@ -948,6 +1032,28 @@ BEGIN
         p_service_order_item_id,
         p_warehouse_id
     );
+
+    /*
+     * 8. Record audit event.
+     */
+    INSERT INTO services.service_events (
+        organization_id,
+        service_order_id,
+        service_order_item_id,
+        event_type,
+        changed_by_user_id,
+        initiated_by,
+        reason
+    )
+    VALUES (
+        p_organization_id,
+        v_service_order_id,
+        p_service_order_item_id,
+        'inventory_consumed',
+        p_performed_by_user_id,
+        'employee',
+        'Service inventory consumed'
+    );
 END;
 $$;
 --------------------------------------------------------------
@@ -958,6 +1064,8 @@ CREATE OR REPLACE FUNCTION services.cancel_service(
     p_organization_id INTEGER,
     p_appointment_id BIGINT,
     p_service_order_item_id BIGINT,
+    p_changed_by_user_id INTEGER,
+    p_initiated_by VARCHAR,
     p_reason TEXT DEFAULT NULL
 )
 RETURNS VOID
@@ -965,15 +1073,32 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_item_status VARCHAR;
+    v_service_order_id BIGINT;
     v_cancelled_status_id BIGINT;
 BEGIN
     /*
-     * 1. Verify the item is attached to the appointment
+     * 1. Validate initiated_by.
+     */
+    IF p_initiated_by NOT IN (
+        'customer',
+        'employee',
+        'manager',
+        'system'
+    ) THEN
+        RAISE EXCEPTION
+            'Invalid initiated_by value: %',
+            p_initiated_by;
+    END IF;
+
+    /*
+     * 2. Verify the item is attached to the appointment
      *    and lock the service-order item.
      */
     SELECT
+        soi.service_order_id,
         sois.status_code
     INTO
+        v_service_order_id,
         v_item_status
     FROM services.appointment_items ai
     JOIN services.service_order_items soi
@@ -996,7 +1121,7 @@ BEGIN
     END IF;
 
     /*
-     * 2. Only active/uncompleted service states may be cancelled.
+     * 3. Only active/uncompleted states may be cancelled.
      */
     IF v_item_status NOT IN ('pending', 'scheduled', 'in_progress') THEN
         RAISE EXCEPTION
@@ -1006,7 +1131,7 @@ BEGIN
     END IF;
 
     /*
-     * 3. Get the cancelled status ID.
+     * 4. Get cancelled status ID.
      */
     SELECT service_order_item_status_id
     INTO v_cancelled_status_id
@@ -1019,7 +1144,7 @@ BEGIN
     END IF;
 
     /*
-     * 4. Cancel the service.
+     * 5. Cancel the service.
      */
     UPDATE services.service_order_items
     SET
@@ -1029,6 +1154,28 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP
     WHERE organization_id = p_organization_id
       AND service_order_item_id = p_service_order_item_id;
+
+    /*
+     * 6. Record audit event.
+     */
+    INSERT INTO services.service_events (
+        organization_id,
+        service_order_id,
+        service_order_item_id,
+        event_type,
+        changed_by_user_id,
+        initiated_by,
+        reason
+    )
+    VALUES (
+        p_organization_id,
+        v_service_order_id,
+        p_service_order_item_id,
+        'service_cancelled',
+        p_changed_by_user_id,
+        p_initiated_by,
+        p_reason
+    );
 END;
 $$;
 --------------------------------------------------------------
@@ -1038,6 +1185,8 @@ $$;
 CREATE OR REPLACE FUNCTION services.cancel_service_order(
     p_organization_id INTEGER,
     p_service_order_id BIGINT,
+    p_changed_by_user_id INTEGER,
+    p_initiated_by VARCHAR,
     p_reason TEXT DEFAULT NULL
 )
 RETURNS VOID
@@ -1049,7 +1198,21 @@ DECLARE
     v_cancelled_item_status_id BIGINT;
 BEGIN
     /*
-     * 1. Lock and validate the service order.
+     * 1. Validate initiated_by.
+     */
+    IF p_initiated_by NOT IN (
+        'customer',
+        'employee',
+        'manager',
+        'system'
+    ) THEN
+        RAISE EXCEPTION
+            'Invalid initiated_by value: %',
+            p_initiated_by;
+    END IF;
+
+    /*
+     * 2. Lock and validate the service order.
      */
     SELECT sos.status_code
     INTO v_order_status
@@ -1068,7 +1231,7 @@ BEGIN
     END IF;
 
     /*
-     * 2. Reject terminal order states.
+     * 3. Reject terminal order states.
      */
     IF v_order_status IN ('completed', 'cancelled') THEN
         RAISE EXCEPTION
@@ -1078,7 +1241,7 @@ BEGIN
     END IF;
 
     /*
-     * 3. A completed child service blocks whole-order cancellation.
+     * 4. A completed child service blocks whole-order cancellation.
      */
     IF EXISTS (
         SELECT 1
@@ -1096,7 +1259,7 @@ BEGIN
     END IF;
 
     /*
-     * 4. Get cancelled status IDs.
+     * 5. Get cancelled status IDs.
      */
     SELECT service_order_status_id
     INTO v_cancelled_order_status_id
@@ -1119,7 +1282,7 @@ BEGIN
     END IF;
 
     /*
-     * 5. Cancel all remaining active service items.
+     * 6. Cancel active child items.
      */
     UPDATE services.service_order_items soi
     SET
@@ -1135,7 +1298,7 @@ BEGIN
       AND sois.status_code IN ('pending', 'scheduled', 'in_progress');
 
     /*
-     * 6. Cancel the parent service order.
+     * 7. Cancel parent order.
      */
     UPDATE services.service_orders
     SET
@@ -1143,11 +1306,32 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP
     WHERE organization_id = p_organization_id
       AND service_order_id = p_service_order_id;
+
+    /*
+     * 8. Record audit event.
+     */
+    INSERT INTO services.service_events (
+        organization_id,
+        service_order_id,
+        service_order_item_id,
+        event_type,
+        changed_by_user_id,
+        initiated_by,
+        reason
+    )
+    VALUES (
+        p_organization_id,
+        p_service_order_id,
+        NULL,
+        'order_cancelled',
+        p_changed_by_user_id,
+        p_initiated_by,
+        p_reason
+    );
 END;
 $$;
-
 --------------------------------------------------------------
------------services.mark_no_show
+-----------services.mark_no_show function 
 --------------------------------------------------------------
 CREATE OR REPLACE FUNCTION services.mark_no_show(
     p_organization_id INTEGER,
@@ -1163,6 +1347,7 @@ DECLARE
     v_appointment_status VARCHAR;
     v_no_show_appointment_status_id BIGINT;
     v_no_show_item_status_id BIGINT;
+    v_item RECORD;
 BEGIN
     /*
      * 1. Lock and validate the appointment.
@@ -1194,7 +1379,21 @@ BEGIN
     END IF;
 
     /*
-     * 3. Get no-show status IDs.
+     * 3. Validate initiated_by.
+     */
+    IF p_initiated_by NOT IN (
+        'customer',
+        'employee',
+        'manager',
+        'system'
+    ) THEN
+        RAISE EXCEPTION
+            'Invalid initiated_by value: %',
+            p_initiated_by;
+    END IF;
+
+    /*
+     * 4. Get no-show status IDs.
      */
     SELECT appointment_status_id
     INTO v_no_show_appointment_status_id
@@ -1217,25 +1416,57 @@ BEGIN
     END IF;
 
     /*
-     * 4. Mark eligible attached service items as no-show.
+     * 5. Mark eligible attached service items as no-show,
+     *    one at a time so each can receive an audit event.
      */
-    UPDATE services.service_order_items soi
-    SET
-        service_order_item_status_id = v_no_show_item_status_id,
-        no_show_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP
-    FROM services.appointment_items ai,
-         services.service_order_item_statuses sois
-    WHERE ai.organization_id = p_organization_id
-      AND ai.appointment_id = p_appointment_id
-      AND ai.service_order_item_id = soi.service_order_item_id
-      AND ai.organization_id = soi.organization_id
-      AND sois.service_order_item_status_id =
-          soi.service_order_item_status_id
-      AND sois.status_code IN ('pending', 'scheduled');
+    FOR v_item IN
+        SELECT
+            soi.service_order_id,
+            soi.service_order_item_id
+        FROM services.appointment_items ai
+        JOIN services.service_order_items soi
+          ON soi.organization_id = ai.organization_id
+         AND soi.service_order_id = ai.service_order_id
+         AND soi.service_order_item_id = ai.service_order_item_id
+        JOIN services.service_order_item_statuses sois
+          ON sois.service_order_item_status_id =
+             soi.service_order_item_status_id
+        WHERE ai.organization_id = p_organization_id
+          AND ai.appointment_id = p_appointment_id
+          AND sois.status_code IN ('pending', 'scheduled')
+        FOR UPDATE OF soi
+    LOOP
+        UPDATE services.service_order_items
+        SET
+            service_order_item_status_id = v_no_show_item_status_id,
+            no_show_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE organization_id = p_organization_id
+          AND service_order_item_id =
+              v_item.service_order_item_id;
+
+        INSERT INTO services.service_events (
+            organization_id,
+            service_order_id,
+            service_order_item_id,
+            event_type,
+            changed_by_user_id,
+            initiated_by,
+            reason
+        )
+        VALUES (
+            p_organization_id,
+            v_item.service_order_id,
+            v_item.service_order_item_id,
+            'service_no_show',
+            p_changed_by_user_id,
+            p_initiated_by,
+            p_reason
+        );
+    END LOOP;
 
     /*
-     * 5. Change the appointment status using the approved function.
+     * 6. Change appointment status through the approved function.
      */
     PERFORM services.change_appointment_status(
         p_organization_id,
@@ -1247,6 +1478,81 @@ BEGIN
     );
 END;
 $$;
+
+--------------------------------------------------------------
+-------------------service.service_events create table
+-------------------------------------------------------------
+CREATE TABLE services.service_events (
+    service_event_id BIGSERIAL PRIMARY KEY,
+
+    organization_id INTEGER NOT NULL,
+    service_order_id BIGINT NOT NULL,
+    service_order_item_id BIGINT,
+
+    event_type VARCHAR(50) NOT NULL,
+
+    changed_by_user_id INTEGER,
+    initiated_by VARCHAR(20),
+    reason TEXT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT chk_service_events_event_type
+        CHECK (
+            event_type IN (
+                'service_started',
+                'service_completed',
+                'inventory_consumed',
+                'service_cancelled',
+                'order_cancelled',
+                'service_no_show'
+            )
+        ),
+
+    CONSTRAINT chk_service_events_initiated_by
+        CHECK (
+            initiated_by IS NULL
+            OR initiated_by IN (
+                'customer',
+                'employee',
+                'manager',
+                'system'
+            )
+        ),
+
+    CONSTRAINT fk_service_events_order
+        FOREIGN KEY (
+            organization_id,
+            service_order_id
+        )
+        REFERENCES services.service_orders (
+            organization_id,
+            service_order_id
+        )
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_events_item
+        FOREIGN KEY (
+            organization_id,
+            service_order_item_id
+        )
+        REFERENCES services.service_order_items (
+            organization_id,
+            service_order_item_id
+        )
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_events_changed_by
+        FOREIGN KEY (
+            organization_id,
+            changed_by_user_id
+        )
+        REFERENCES public.organization_users (
+            organization_id,
+            user_id
+        )
+        ON DELETE RESTRICT
+);
 
 ---------------------------------------------------------------
 ----------------trg_validate_appointment-trigger
