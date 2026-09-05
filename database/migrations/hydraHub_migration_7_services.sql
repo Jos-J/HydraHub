@@ -389,7 +389,7 @@ CREATE TABLE services.appointments (
         )
 );
 --------------------------------------------------------------------
-------------------------services.appointment_items
+------------------------services.appointment_items table
 --------------------------------------------------------------------
 
 CREATE TABLE services.appointment_items (
@@ -433,6 +433,32 @@ CREATE TABLE services.appointment_items (
             service_order_id,
             service_order_item_id
         )
+);
+------------------------------------------------------------
+-----------service.service_inventory_consumptions table
+------------------------------------------------------------
+CREATE TABLE services.service_inventory_consumptions (
+    service_inventory_consumption_id BIGSERIAL PRIMARY KEY,
+    organization_id INTEGER NOT NULL,
+    service_order_item_id BIGINT NOT NULL,
+    warehouse_id INTEGER NOT NULL,
+    consumed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_service_inventory_consumption_item
+        UNIQUE (organization_id, service_order_item_id),
+
+    CONSTRAINT fk_service_inventory_consumption_item
+        FOREIGN KEY (organization_id, service_order_item_id)
+        REFERENCES services.service_order_items (
+            organization_id,
+            service_order_item_id
+        )
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_inventory_consumption_warehouse
+        FOREIGN KEY (warehouse_id)
+        REFERENCES public.warehouses (warehouse_id)
+        ON DELETE RESTRICT
 );
 ---------------------------------------------------------------
 ---------------services.validate_appointment_availabilty function
@@ -532,6 +558,399 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+---------------------------------------------------------------
+------------------services.start_services function
+---------------------------------------------------------------
+CREATE OR REPLACE FUNCTION services.start_service(
+    p_organization_id INTEGER,
+    p_appointment_id BIGINT,
+    p_service_order_item_id BIGINT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_appointment_status VARCHAR;
+    v_item_status VARCHAR;
+    v_service_id BIGINT;
+    v_employee_user_id INTEGER;
+    v_in_progress_status_id BIGINT;
+BEGIN
+    /*
+     * 1. Verify the appointment exists and get the
+     *    assigned employee + current appointment status.
+     */
+    SELECT
+        aps.status_code,
+        a.user_id
+    INTO
+        v_appointment_status,
+        v_employee_user_id
+    FROM services.appointments a
+    JOIN services.appointment_statuses aps
+        ON aps.appointment_status_id = a.appointment_status_id
+    WHERE a.organization_id = p_organization_id
+      AND a.appointment_id = p_appointment_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Appointment % not found for organization %',
+            p_appointment_id,
+            p_organization_id;
+    END IF;
+
+    /*
+     * 2. The appointment itself must already be started.
+     */
+    IF v_appointment_status <> 'in_progress' THEN
+        RAISE EXCEPTION
+            'Service cannot be started because appointment % is currently %',
+            p_appointment_id,
+            v_appointment_status;
+    END IF;
+
+    /*
+     * 3. Verify this service-order item is actually
+     *    attached to this appointment.
+     */
+    SELECT
+        soi.service_id,
+        sois.status_code
+    INTO
+        v_service_id,
+        v_item_status
+    FROM services.appointment_items ai
+    JOIN services.service_order_items soi
+        ON soi.organization_id = ai.organization_id
+       AND soi.service_order_id = ai.service_order_id
+       AND soi.service_order_item_id = ai.service_order_item_id
+    JOIN services.service_order_item_statuses sois
+        ON sois.service_order_item_status_id =
+           soi.service_order_item_status_id
+    WHERE ai.organization_id = p_organization_id
+      AND ai.appointment_id = p_appointment_id
+      AND ai.service_order_item_id = p_service_order_item_id
+    FOR UPDATE OF soi;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service order item % is not attached to appointment %',
+            p_service_order_item_id,
+            p_appointment_id;
+    END IF;
+
+    /*
+     * 4. Only pending or scheduled services may start.
+     */
+    IF v_item_status NOT IN ('pending', 'scheduled') THEN
+        RAISE EXCEPTION
+            'Service order item % cannot be started from status %',
+            p_service_order_item_id,
+            v_item_status;
+    END IF;
+
+    /*
+     * 5. Verify the appointment employee is authorized
+     *    to perform this particular service.
+     */
+    IF NOT EXISTS (
+        SELECT 1
+        FROM services.employee_services es
+        WHERE es.organization_id = p_organization_id
+          AND es.user_id = v_employee_user_id
+          AND es.service_id = v_service_id
+          AND es.is_active = TRUE
+    ) THEN
+        RAISE EXCEPTION
+            'Employee % is not authorized to perform service %',
+            v_employee_user_id,
+            v_service_id;
+    END IF;
+
+    /*
+     * 6. Get the in_progress status ID.
+     */
+    SELECT service_order_item_status_id
+    INTO v_in_progress_status_id
+    FROM services.service_order_item_statuses
+    WHERE status_code = 'in_progress';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service-order-item status in_progress does not exist';
+    END IF;
+
+    /*
+     * 7. Start this individual service.
+     */
+    UPDATE services.service_order_items
+    SET
+        service_order_item_status_id = v_in_progress_status_id,
+        started_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE organization_id = p_organization_id
+      AND service_order_item_id = p_service_order_item_id;
+END;
+$$;
+-------------------------------------------------------------
+------------services.complete_service function
+-------------------------------------------------------------
+CREATE OR REPLACE FUNCTION services.complete_service(
+    p_organization_id INTEGER,
+    p_appointment_id BIGINT,
+    p_service_order_item_id BIGINT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_item_status VARCHAR;
+    v_completed_status_id BIGINT;
+BEGIN
+    /*
+     * 1. Verify the service item is attached
+     *    to the appointment and lock it.
+     */
+    SELECT
+        sois.status_code
+    INTO
+        v_item_status
+    FROM services.appointment_items ai
+    JOIN services.service_order_items soi
+        ON soi.organization_id = ai.organization_id
+       AND soi.service_order_id = ai.service_order_id
+       AND soi.service_order_item_id = ai.service_order_item_id
+    JOIN services.service_order_item_statuses sois
+        ON sois.service_order_item_status_id =
+           soi.service_order_item_status_id
+    WHERE ai.organization_id = p_organization_id
+      AND ai.appointment_id = p_appointment_id
+      AND ai.service_order_item_id = p_service_order_item_id
+    FOR UPDATE OF soi;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service order item % is not attached to appointment %',
+            p_service_order_item_id,
+            p_appointment_id;
+    END IF;
+
+    /*
+     * 2. Only an in-progress service may be completed.
+     */
+    IF v_item_status <> 'in_progress' THEN
+        RAISE EXCEPTION
+            'Service order item % cannot be completed from status %',
+            p_service_order_item_id,
+            v_item_status;
+    END IF;
+
+    /*
+     * 3. Get the completed status ID.
+     */
+    SELECT service_order_item_status_id
+    INTO v_completed_status_id
+    FROM services.service_order_item_statuses
+    WHERE status_code = 'completed';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service-order-item status completed does not exist';
+    END IF;
+
+    /*
+     * 4. Complete the service.
+     */
+    UPDATE services.service_order_items
+    SET
+        service_order_item_status_id = v_completed_status_id,
+        completed_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE organization_id = p_organization_id
+      AND service_order_item_id = p_service_order_item_id;
+END;
+$$;
+
+--------------------------------------------------------------
+------------services.consume_service_inventory function 
+---------------------------------------------------------------
+CREATE OR REPLACE FUNCTION services.consume_service_inventory(
+    p_organization_id INTEGER,
+    p_service_order_item_id BIGINT,
+    p_warehouse_id INTEGER,
+    p_performed_by_user_id INTEGER
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_service_id BIGINT;
+    v_item_status VARCHAR;
+    v_requirement RECORD;
+    v_quantity_available INTEGER;
+BEGIN
+    /*
+     * 1. Lock and validate the service-order item.
+     */
+    SELECT
+        soi.service_id,
+        sois.status_code
+    INTO
+        v_service_id,
+        v_item_status
+    FROM services.service_order_items soi
+    JOIN services.service_order_item_statuses sois
+        ON sois.service_order_item_status_id =
+           soi.service_order_item_status_id
+    WHERE soi.organization_id = p_organization_id
+      AND soi.service_order_item_id = p_service_order_item_id
+    FOR UPDATE OF soi;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Service order item % not found for organization %',
+            p_service_order_item_id,
+            p_organization_id;
+    END IF;
+
+    /*
+     * 2. Inventory may only be consumed for a completed service.
+     */
+    IF v_item_status <> 'completed' THEN
+        RAISE EXCEPTION
+            'Inventory cannot be consumed because service order item % is currently %',
+            p_service_order_item_id,
+            v_item_status;
+    END IF;
+
+    /*
+     * 3. Prevent duplicate consumption.
+     */
+    IF EXISTS (
+        SELECT 1
+        FROM services.service_inventory_consumptions sic
+        WHERE sic.organization_id = p_organization_id
+          AND sic.service_order_item_id = p_service_order_item_id
+    ) THEN
+        RAISE EXCEPTION
+            'Inventory has already been consumed for service order item %',
+            p_service_order_item_id;
+    END IF;
+
+    /*
+     * 4. Validate warehouse belongs to the same organization.
+     */
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.warehouses w
+        WHERE w.warehouse_id = p_warehouse_id
+          AND w.organization_id = p_organization_id
+          AND w.is_active = TRUE
+    ) THEN
+        RAISE EXCEPTION
+            'Warehouse % is not an active warehouse for organization %',
+            p_warehouse_id,
+            p_organization_id;
+    END IF;
+
+    /*
+     * 5. Check every inventory requirement before changing stock.
+     */
+    FOR v_requirement IN
+        SELECT
+            sir.variant_id,
+            sir.quantity_required
+        FROM services.service_inventory_requirements sir
+        WHERE sir.organization_id = p_organization_id
+          AND sir.service_id = v_service_id
+          AND sir.is_active = TRUE
+    LOOP
+        SELECT
+            wi.quantity_on_hand - wi.quantity_reserved
+        INTO
+            v_quantity_available
+        FROM public.warehouse_inventory wi
+        WHERE wi.warehouse_id = p_warehouse_id
+          AND wi.variant_id = v_requirement.variant_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION
+                'Variant % is not stocked in warehouse %',
+                v_requirement.variant_id,
+                p_warehouse_id;
+        END IF;
+
+        IF v_quantity_available < v_requirement.quantity_required THEN
+            RAISE EXCEPTION
+                'Insufficient inventory for variant %. Required %, available %',
+                v_requirement.variant_id,
+                v_requirement.quantity_required,
+                v_quantity_available;
+        END IF;
+    END LOOP;
+
+    /*
+     * 6. Deduct stock and record transactions.
+     */
+    FOR v_requirement IN
+        SELECT
+            sir.variant_id,
+            sir.quantity_required
+        FROM services.service_inventory_requirements sir
+        WHERE sir.organization_id = p_organization_id
+          AND sir.service_id = v_service_id
+          AND sir.is_active = TRUE
+    LOOP
+        UPDATE public.warehouse_inventory
+        SET
+            quantity_on_hand =
+                quantity_on_hand - v_requirement.quantity_required,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE warehouse_id = p_warehouse_id
+          AND variant_id = v_requirement.variant_id;
+
+        INSERT INTO public.inventory_transactions (
+            variant_id,
+            transaction_type,
+            quantity_change,
+            notes,
+            organization_id,
+            warehouse_id,
+            performed_by_user_id,
+            reference_type,
+            reference_id
+        )
+        VALUES (
+            v_requirement.variant_id,
+            'STOCK_OUT',
+            -v_requirement.quantity_required,
+            'Service inventory consumption',
+            p_organization_id,
+            p_warehouse_id,
+            p_performed_by_user_id,
+            'SERVICE_ORDER_ITEM',
+            p_service_order_item_id
+        );
+    END LOOP;
+
+    /*
+     * 7. Mark this service item as consumed.
+     */
+    INSERT INTO services.service_inventory_consumptions (
+        organization_id,
+        service_order_item_id,
+        warehouse_id
+    )
+    VALUES (
+        p_organization_id,
+        p_service_order_item_id,
+        p_warehouse_id
+    );
+END;
+$$;
+
 ---------------------------------------------------------------
 ----------------trg_validate_appointment-trigger
 --------------------------------------------------------------
