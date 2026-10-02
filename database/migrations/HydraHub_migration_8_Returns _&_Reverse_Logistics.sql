@@ -1,7 +1,172 @@
-------------------------------------------------------------------------
+--------------------------------------------------------------------------------
 -----------------------Migration 8 — Returns & Reverse Logistics
-------------------------------------------------------------------------
+--------------------------------------------------------------------------------
 
+
+
+--------------------------------------------------------------------------------
+-------------------------fulfillment.validate_package_content_quantity function
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fulfillment.validate_package_content_quantity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_shipment_item_quantity INTEGER;
+    v_packaged_quantity BIGINT;
+    v_remaining_quantity BIGINT;
+BEGIN
+    /*
+     * Lock the shipment item.
+     *
+     * This serializes competing package allocations against
+     * the same shipment item.
+     */
+    SELECT si.quantity
+    INTO v_shipment_item_quantity
+    FROM fulfillment.shipment_items si
+    WHERE si.organization_id = NEW.organization_id
+      AND si.shipment_id = NEW.shipment_id
+      AND si.shipment_item_id = NEW.shipment_item_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Shipment item % does not exist for shipment % in organization %',
+            NEW.shipment_item_id,
+            NEW.shipment_id,
+            NEW.organization_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Calculate quantity already allocated to packages.
+     *
+     * During UPDATE, exclude the existing package-content
+     * row so its old quantity is not counted against its
+     * replacement quantity.
+     */
+    SELECT COALESCE(SUM(pc.quantity), 0)
+    INTO v_packaged_quantity
+    FROM fulfillment.package_contents pc
+    WHERE pc.organization_id = NEW.organization_id
+      AND pc.shipment_id = NEW.shipment_id
+      AND pc.shipment_item_id = NEW.shipment_item_id
+      AND (
+          TG_OP <> 'UPDATE'
+          OR pc.package_content_id <> OLD.package_content_id
+      );
+
+    v_remaining_quantity :=
+        v_shipment_item_quantity - v_packaged_quantity;
+
+    /*
+     * Package contents cannot represent more units than
+     * exist on the shipment item.
+     */
+    IF NEW.quantity > v_remaining_quantity THEN
+        RAISE EXCEPTION
+            'Package content quantity exceeds shipment item quantity. Shipment item quantity: %, already packaged: %, requested: %, remaining: %',
+            v_shipment_item_quantity,
+            v_packaged_quantity,
+            NEW.quantity,
+            v_remaining_quantity
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    RETURN NEW;
+END;
+$function$;
+
+--------------------------------------------------------------------------
+---------------------fulfillment.validate_shipment_item_quantity function
+--------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fulfillment.validate_shipment_item_quantity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_shipped_quantity   integer;
+    v_allocated_quantity integer;
+    v_packaged_quantity  integer;
+    v_remaining_quantity integer;
+BEGIN
+    /*
+     * Lock the fulfillment-order item whose shipped quantity
+     * is the upper limit for shipment-item allocation.
+     */
+    SELECT foi.shipped_quantity
+    INTO v_shipped_quantity
+    FROM fulfillment.fulfillment_order_items foi
+    WHERE foi.fulfillment_order_id = NEW.fulfillment_order_id
+      AND foi.fulfillment_order_item_id = NEW.fulfillment_order_item_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Fulfillment order item % does not exist for fulfillment order %',
+            NEW.fulfillment_order_item_id,
+            NEW.fulfillment_order_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Determine how much of the fulfillment-order item has
+     * already been allocated to other shipment items.
+     *
+     * On UPDATE, exclude the row being replaced.
+     */
+    SELECT COALESCE(SUM(si.quantity), 0)
+    INTO v_allocated_quantity
+    FROM fulfillment.shipment_items si
+    WHERE si.fulfillment_order_id = NEW.fulfillment_order_id
+      AND si.fulfillment_order_item_id = NEW.fulfillment_order_item_id
+      AND (
+            TG_OP <> 'UPDATE'
+            OR si.shipment_item_id <> OLD.shipment_item_id
+          );
+
+    v_remaining_quantity :=
+        v_shipped_quantity - v_allocated_quantity;
+
+    IF NEW.quantity > v_remaining_quantity THEN
+        RAISE EXCEPTION
+            'Shipment item quantity exceeds shipped quantity. Shipped: %, already allocated: %, requested: %, remaining: %',
+            v_shipped_quantity,
+            v_allocated_quantity,
+            NEW.quantity,
+            v_remaining_quantity
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * On UPDATE, protect quantities already assigned to packages.
+     *
+     * A shipment item cannot be reduced below the amount that
+     * package_contents already references.
+     */
+    IF TG_OP = 'UPDATE' THEN
+        SELECT COALESCE(SUM(pc.quantity), 0)
+        INTO v_packaged_quantity
+        FROM fulfillment.package_contents pc
+        WHERE pc.organization_id = OLD.organization_id
+          AND pc.shipment_id = OLD.shipment_id
+          AND pc.shipment_item_id = OLD.shipment_item_id;
+
+        IF NEW.quantity < v_packaged_quantity THEN
+            RAISE EXCEPTION
+                'Shipment item quantity cannot be less than packaged quantity. Packaged: %, requested: %',
+                v_packaged_quantity,
+                NEW.quantity
+                USING ERRCODE = 'P0001';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
 ------------------------------------------------------------------------
 -----------------------------fulfillment.shipment_events table
 ------------------------------------------------------------------------
@@ -81,8 +246,33 @@ CREATE TABLE fulfillment.shipment_events (
             OR jsonb_typeof(metadata) = 'object'
         )
 );
+----------------------------------------------------------------------
+----------------------------triggers---------------------------------
+-----------------------------------------------------------------------
+-------------------------validate package content quantity trigger
+----------------------------------------------------------------------
+CREATE TRIGGER trg_validate_package_content_quantity
+BEFORE INSERT OR UPDATE OF
+    quantity,
+    organization_id,
+    shipment_id,
+    shipment_item_id
+ON fulfillment.package_contents
+FOR EACH ROW
+EXECUTE FUNCTION fulfillment.validate_package_content_quantity();
 
+-----------------------------------------------------------------------
+--------------------- validate_shipment_item_quantity trigger
+-----------------------------------------------------------------------
 
+CREATE TRIGGER trg_validate_shipment_item_quantity
+BEFORE INSERT OR UPDATE OF
+    quantity,
+    fulfillment_order_id,
+    fulfillment_order_item_id
+ON fulfillment.shipment_items
+FOR EACH ROW
+EXECUTE FUNCTION fulfillment.validate_shipment_item_quantity();
 
 ------------------------------------------------------------------------
 ----------------trg_prevent_delivery_event_mutation trigger
@@ -1243,14 +1433,15 @@ ON fulfillment.package_events
 FOR EACH ROW
 EXECUTE FUNCTION fulfillment.prevent_package_event_mutation();
 ---------------------------------------------------------------------
-----------------------------fulfillment.transition_package_status
+------------function fulfillment.transition_package_status
 ---------------------------------------------------------------------
+
 CREATE OR REPLACE FUNCTION fulfillment.transition_package_status(
-    p_package_id BIGINT,
-    p_new_status_code VARCHAR(30),
-    p_performed_by_user_id INTEGER DEFAULT NULL,
-    p_reason TEXT DEFAULT NULL,
-    p_metadata JSONB DEFAULT NULL
+    p_package_id bigint,
+    p_new_status_code character varying,
+    p_performed_by_user_id integer DEFAULT NULL::integer,
+    p_reason text DEFAULT NULL::text,
+    p_metadata jsonb DEFAULT NULL::jsonb
 )
 RETURNS fulfillment.packages
 LANGUAGE plpgsql
@@ -1261,6 +1452,7 @@ DECLARE
 
     v_previous_status_code VARCHAR(30);
     v_event_at TIMESTAMP WITHOUT TIME ZONE;
+    v_package_content_count BIGINT;
 BEGIN
     /*
      * Validate parameters.
@@ -1346,7 +1538,9 @@ BEGIN
      * Physical package state machine.
      *
      * open   -> sealed / voided
-     * sealed -> shipped / voided
+     * sealed -> shipped
+     *
+     * Only an open package may be voided.
      *
      * shipped and voided are terminal.
      */
@@ -1361,10 +1555,7 @@ BEGIN
         OR
         (
             v_previous_status_code = 'sealed'
-            AND p_new_status_code IN (
-                'shipped',
-                'voided'
-            )
+            AND p_new_status_code = 'shipped'
         )
     ) THEN
         RAISE EXCEPTION
@@ -1373,6 +1564,32 @@ BEGIN
             v_previous_status_code,
             p_new_status_code
             USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * SEAL VALIDATION
+     *
+     * A physical package cannot become sealed unless it
+     * contains at least one package-content row.
+     *
+     * An empty open package may still transition to voided.
+     */
+    IF p_new_status_code = 'sealed' THEN
+
+        SELECT COUNT(*)
+        INTO v_package_content_count
+        FROM fulfillment.package_contents pc
+        WHERE pc.organization_id = v_package.organization_id
+          AND pc.shipment_id = v_package.shipment_id
+          AND pc.package_id = v_package.package_id;
+
+        IF v_package_content_count = 0 THEN
+            RAISE EXCEPTION
+                'Package % cannot become sealed without package contents',
+                p_package_id
+                USING ERRCODE = 'P0001';
+        END IF;
+
     END IF;
 
     /*
@@ -1408,9 +1625,8 @@ BEGIN
      * sealed -> shipped:
      *     preserve sealed_at and establish shipped_at.
      *
-     * open/sealed -> voided:
-     *     preserve an existing sealed_at but never establish
-     *     shipped_at.
+     * open -> voided:
+     *     sealed_at and shipped_at remain NULL.
      */
     UPDATE fulfillment.packages
     SET
@@ -1467,16 +1683,16 @@ BEGIN
     RETURN v_updated_package;
 END;
 $function$;
----------------------------------------------------------
+------------------------------------------------------------
 --------function fulfillment transition shipment status
----------------------------------------------------------
+------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION fulfillment.transition_shipment_status(
-    p_shipment_id BIGINT,
-    p_new_status_code VARCHAR(30),
-    p_performed_by_user_id INTEGER DEFAULT NULL,
-    p_reason TEXT DEFAULT NULL,
-    p_metadata JSONB DEFAULT NULL
+    p_shipment_id bigint,
+    p_new_status_code character varying,
+    p_performed_by_user_id integer DEFAULT NULL,
+    p_reason text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL
 )
 RETURNS fulfillment.shipments
 LANGUAGE plpgsql
@@ -1491,6 +1707,7 @@ DECLARE
     v_shipment_item_count BIGINT;
     v_package_count BIGINT;
     v_unready_package_count BIGINT;
+    v_unreconciled_item_count BIGINT;
 BEGIN
     /*
      * Validate parameters.
@@ -1613,9 +1830,8 @@ BEGIN
      * 1. It contains at least one shipment item.
      * 2. It contains at least one active package.
      * 3. Every active package is sealed.
-     *
-     * Exact shipment/package quantity reconciliation is
-     * intentionally handled later in Phase 3A.8.
+     * 4. Every shipment item is fully accounted for
+     *    by package contents.
      */
     IF p_new_status_code = 'ready' THEN
 
@@ -1662,19 +1878,42 @@ BEGIN
                 USING ERRCODE = 'P0001';
         END IF;
 
+        /*
+         * Every shipment-item quantity must exactly equal the
+         * quantity assigned to active packages.
+         *
+         * Contents belonging to voided packages do not count.
+         */
+        SELECT COUNT(*)
+        INTO v_unreconciled_item_count
+        FROM fulfillment.shipment_items si
+        WHERE si.organization_id = v_shipment.organization_id
+          AND si.shipment_id = v_shipment.shipment_id
+          AND si.quantity <> (
+              SELECT COALESCE(SUM(pc.quantity), 0)
+              FROM fulfillment.package_contents pc
+              JOIN fulfillment.packages p
+                ON p.organization_id = pc.organization_id
+               AND p.package_id = pc.package_id
+               AND p.shipment_id = pc.shipment_id
+              WHERE pc.organization_id = si.organization_id
+                AND pc.shipment_id = si.shipment_id
+                AND pc.shipment_item_id = si.shipment_item_id
+                AND p.status_code <> 'voided'
+          );
+
+        IF v_unreconciled_item_count > 0 THEN
+            RAISE EXCEPTION
+                'Shipment % cannot become ready because % shipment item(s) are not fully packaged',
+                p_shipment_id,
+                v_unreconciled_item_count
+                USING ERRCODE = 'P0001';
+        END IF;
+
     END IF;
 
     /*
      * SHIPPED VALIDATION
-     *
-     * A shipment can become shipped only when:
-     *
-     * 1. It contains at least one active package.
-     * 2. Every active package has reached physical
-     *    package status 'shipped'.
-     *
-     * Voided packages are ignored because they are no
-     * longer part of the active shipment.
      */
     IF p_new_status_code = 'shipped' THEN
 
@@ -1737,12 +1976,6 @@ BEGIN
 
     /*
      * Update shipment state.
-     *
-     * shipped_at is established only when the shipment
-     * reaches 'shipped'.
-     *
-     * pending, ready, and cancelled must have
-     * shipped_at = NULL.
      */
     UPDATE fulfillment.shipments
     SET
@@ -1791,3 +2024,236 @@ BEGIN
 END;
 $function$;
 --------------------------------------------------
+
+------------------------------------------------------------------
+-------------function fulfillment.protect_package_contents
+------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fulfillment.protect_package_contents()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_package_status VARCHAR(30);
+    v_package_id BIGINT;
+    v_organization_id INTEGER;
+    v_shipment_id BIGINT;
+BEGIN
+    /*
+     * Determine which package owns the content row.
+     *
+     * INSERT uses NEW.
+     * DELETE uses OLD.
+     * UPDATE protects the existing package represented by OLD.
+     */
+    IF TG_OP = 'INSERT' THEN
+        v_package_id := NEW.package_id;
+        v_organization_id := NEW.organization_id;
+        v_shipment_id := NEW.shipment_id;
+    ELSE
+        v_package_id := OLD.package_id;
+        v_organization_id := OLD.organization_id;
+        v_shipment_id := OLD.shipment_id;
+    END IF;
+
+    /*
+     * Lock the package while validating its physical state.
+     */
+    SELECT p.status_code
+    INTO v_package_status
+    FROM fulfillment.packages p
+    WHERE p.organization_id = v_organization_id
+      AND p.shipment_id = v_shipment_id
+      AND p.package_id = v_package_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Package % does not exist for shipment % in organization %',
+            v_package_id,
+            v_shipment_id,
+            v_organization_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Package contents may only change while the package
+     * remains physically open.
+     */
+    IF v_package_status <> 'open' THEN
+        RAISE EXCEPTION
+            'Package contents cannot be modified when package % is in status %. Package must be open',
+            v_package_id,
+            v_package_status
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * If an UPDATE attempts to move the content row to another
+     * package, the destination package must also be open.
+     *
+     * Existing foreign keys continue to enforce organization /
+     * shipment / package relationships.
+     */
+    IF TG_OP = 'UPDATE'
+       AND (
+            NEW.package_id IS DISTINCT FROM OLD.package_id
+            OR NEW.organization_id IS DISTINCT FROM OLD.organization_id
+            OR NEW.shipment_id IS DISTINCT FROM OLD.shipment_id
+       ) THEN
+
+        SELECT p.status_code
+        INTO v_package_status
+        FROM fulfillment.packages p
+        WHERE p.organization_id = NEW.organization_id
+          AND p.shipment_id = NEW.shipment_id
+          AND p.package_id = NEW.package_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION
+                'Destination package % does not exist for shipment % in organization %',
+                NEW.package_id,
+                NEW.shipment_id,
+                NEW.organization_id
+                USING ERRCODE = 'P0002';
+        END IF;
+
+        IF v_package_status <> 'open' THEN
+            RAISE EXCEPTION
+                'Package contents cannot be moved to package % because it is in status %. Package must be open',
+                NEW.package_id,
+                v_package_status
+                USING ERRCODE = 'P0001';
+        END IF;
+
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+--------------------------------------------------------------------
+------------------- trigger protect package contents
+--------------------------------------------------------------------
+
+CREATE TRIGGER trg_protect_package_contents
+BEFORE INSERT OR UPDATE OR DELETE
+ON fulfillment.package_contents
+FOR EACH ROW
+EXECUTE FUNCTION fulfillment.protect_package_contents();
+
+------------------------------------------------------------------------
+-------------------------- function fulfillment protect shipment items
+------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fulfillment.protect_shipment_items()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_shipment_status VARCHAR(30);
+    v_shipment_id BIGINT;
+    v_organization_id INTEGER;
+BEGIN
+    /*
+     * Determine the current parent shipment.
+     *
+     * INSERT uses NEW.
+     * UPDATE and DELETE protect the shipment represented by OLD.
+     */
+    IF TG_OP = 'INSERT' THEN
+        v_shipment_id := NEW.shipment_id;
+        v_organization_id := NEW.organization_id;
+    ELSE
+        v_shipment_id := OLD.shipment_id;
+        v_organization_id := OLD.organization_id;
+    END IF;
+
+    /*
+     * Lock the parent shipment while validating its state.
+     */
+    SELECT s.status_code
+    INTO v_shipment_status
+    FROM fulfillment.shipments s
+    WHERE s.organization_id = v_organization_id
+      AND s.shipment_id = v_shipment_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Shipment % does not exist in organization %',
+            v_shipment_id,
+            v_organization_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    /*
+     * Shipment items may only change while the shipment
+     * remains pending.
+     */
+    IF v_shipment_status <> 'pending' THEN
+        RAISE EXCEPTION
+            'Shipment items cannot be modified when shipment % is in status %. Shipment must be pending',
+            v_shipment_id,
+            v_shipment_status
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    /*
+     * If an UPDATE attempts to move the item to another
+     * shipment, the destination shipment must also be pending.
+     */
+    IF TG_OP = 'UPDATE'
+       AND (
+            NEW.shipment_id IS DISTINCT FROM OLD.shipment_id
+            OR NEW.organization_id IS DISTINCT FROM OLD.organization_id
+       ) THEN
+
+        SELECT s.status_code
+        INTO v_shipment_status
+        FROM fulfillment.shipments s
+        WHERE s.organization_id = NEW.organization_id
+          AND s.shipment_id = NEW.shipment_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION
+                'Destination shipment % does not exist in organization %',
+                NEW.shipment_id,
+                NEW.organization_id
+                USING ERRCODE = 'P0002';
+        END IF;
+
+        IF v_shipment_status <> 'pending' THEN
+            RAISE EXCEPTION
+                'Shipment items cannot be moved to shipment % because it is in status %. Shipment must be pending',
+                NEW.shipment_id,
+                v_shipment_status
+                USING ERRCODE = 'P0001';
+        END IF;
+
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+-----------------------------------------------------------
+--------------- trigger protect shipment items
+----------------------------------------------------------
+
+CREATE TRIGGER trg_protect_shipment_items
+BEFORE INSERT OR UPDATE OR DELETE
+ON fulfillment.shipment_items
+FOR EACH ROW
+EXECUTE FUNCTION fulfillment.protect_shipment_items();
+
+--------------------------------------------------------
+--------------------
+--------------------------------------------------------
