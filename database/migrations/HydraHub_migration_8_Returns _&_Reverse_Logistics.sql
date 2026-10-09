@@ -2557,5 +2557,226 @@ LEFT JOIN returns.return_policies rp
        prp.return_policy_id
    );
 ------------------------------------------------
----------------
+--------------- function returns eligibility 
 ------------------------------------------------
+CREATE OR REPLACE FUNCTION returns.evaluate_return_eligibility(
+    p_organization_id INTEGER,
+    p_package_content_id BIGINT,
+    p_evaluation_date DATE
+)
+RETURNS TABLE (
+    organization_id INTEGER,
+    sales_order_id INTEGER,
+    sales_order_item_id INTEGER,
+    variant_id INTEGER,
+    package_content_id BIGINT,
+    delivered_quantity INTEGER,
+    delivery_date DATE,
+    resolved_policy_id BIGINT,
+    policy_source TEXT,
+    policy_code VARCHAR(50),
+    return_window_end_date DATE,
+    is_return_eligible BOOLEAN,
+    eligibility_code TEXT
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        diq.organization_id,
+        diq.sales_order_id,
+        diq.sales_order_item_id,
+        diq.variant_id,
+        diq.package_content_id,
+        diq.delivered_quantity,
+        diq.delivered_at::date AS delivery_date,
+
+        rp.resolved_policy_id,
+        rp.policy_source,
+        rp.policy_code,
+
+        CASE
+            WHEN rp.return_window_days IS NOT NULL
+                THEN diq.delivered_at::date
+                     + rp.return_window_days
+            ELSE NULL
+        END AS return_window_end_date,
+
+        CASE
+            WHEN rp.resolved_policy_id IS NULL THEN FALSE
+            WHEN rp.policy_is_active = FALSE THEN FALSE
+            WHEN rp.is_returnable = FALSE THEN FALSE
+            WHEN p_evaluation_date <
+                 diq.delivered_at::date THEN FALSE
+            WHEN p_evaluation_date >
+                 (diq.delivered_at::date + rp.return_window_days)
+                THEN FALSE
+            ELSE TRUE
+        END AS is_return_eligible,
+
+        CASE
+            WHEN rp.resolved_policy_id IS NULL
+                THEN 'RETURN_POLICY_NOT_CONFIGURED'
+            WHEN rp.policy_is_active = FALSE
+                THEN 'RETURN_POLICY_INACTIVE'
+            WHEN rp.is_returnable = FALSE
+                THEN 'PRODUCT_NOT_RETURNABLE'
+            WHEN p_evaluation_date < diq.delivered_at::date
+                THEN 'ITEM_NOT_YET_DELIVERED'
+            WHEN p_evaluation_date >
+                 (diq.delivered_at::date + rp.return_window_days)
+                THEN 'RETURN_WINDOW_EXPIRED'
+            ELSE 'ELIGIBLE'
+        END AS eligibility_code
+
+    FROM returns.delivered_item_quantities diq
+
+    LEFT JOIN returns.resolved_variant_return_policies rp
+        ON rp.organization_id = diq.organization_id
+       AND rp.variant_id = diq.variant_id
+
+    WHERE diq.organization_id = p_organization_id
+      AND diq.package_content_id = p_package_content_id
+      AND p_evaluation_date IS NOT NULL;
+$$;
+---------------------------------------------------------
+------------ function evaluate item return quantity
+--------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION returns.evaluate_item_return_quantity(
+    p_organization_id INTEGER,
+    p_sales_order_item_id INTEGER,
+    p_evaluation_date DATE
+)
+RETURNS TABLE (
+    organization_id INTEGER,
+    sales_order_id INTEGER,
+    sales_order_item_id INTEGER,
+    variant_id INTEGER,
+    fulfilled_quantity INTEGER,
+    total_delivered_quantity BIGINT,
+    eligible_delivered_quantity BIGINT,
+    ineligible_delivered_quantity BIGINT
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        so.organization_id,
+        soi.sales_order_id,
+        soi.sales_order_item_id,
+        soi.variant_id,
+        soi.fulfilled_quantity,
+
+        COALESCE(
+            SUM(e.delivered_quantity),
+            0
+        ) AS total_delivered_quantity,
+
+        COALESCE(
+            SUM(e.delivered_quantity) FILTER (
+                WHERE e.is_return_eligible = TRUE
+            ),
+            0
+        ) AS eligible_delivered_quantity,
+
+        COALESCE(
+            SUM(e.delivered_quantity) FILTER (
+                WHERE e.is_return_eligible = FALSE
+            ),
+            0
+        ) AS ineligible_delivered_quantity
+
+    FROM public.sales_order_items soi
+
+    JOIN public.sales_orders so
+        ON so.sales_order_id = soi.sales_order_id
+
+    LEFT JOIN returns.delivered_item_quantities diq
+        ON diq.organization_id = so.organization_id
+       AND diq.sales_order_id = soi.sales_order_id
+       AND diq.sales_order_item_id = soi.sales_order_item_id
+       AND diq.variant_id = soi.variant_id
+
+    LEFT JOIN LATERAL
+        returns.evaluate_return_eligibility(
+            diq.organization_id,
+            diq.package_content_id,
+            p_evaluation_date
+        ) AS e
+        ON TRUE
+
+    WHERE so.organization_id = p_organization_id
+      AND soi.sales_order_item_id = p_sales_order_item_id
+      AND p_evaluation_date IS NOT NULL
+
+    GROUP BY
+        so.organization_id,
+        soi.sales_order_id,
+        soi.sales_order_item_id,
+        soi.variant_id,
+        soi.fulfilled_quantity;
+$$;
+----------------------------------------------------------
+---------- table return item delivery allocations
+----------------------------------------------------------
+CREATE TABLE returns.return_item_delivery_allocations (
+    allocation_id BIGINT
+        GENERATED BY DEFAULT AS IDENTITY
+        PRIMARY KEY,
+
+    organization_id INTEGER NOT NULL,
+    return_item_id BIGINT NOT NULL,
+    package_content_id BIGINT NOT NULL,
+
+    allocated_quantity INTEGER NOT NULL,
+
+    created_at TIMESTAMPTZ
+        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    updated_at TIMESTAMPTZ
+        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_return_delivery_allocations_org_id
+        UNIQUE (
+            organization_id,
+            allocation_id
+        ),
+
+    CONSTRAINT uq_return_delivery_allocations_item_package
+        UNIQUE (
+            organization_id,
+            return_item_id,
+            package_content_id
+        ),
+
+    CONSTRAINT fk_return_delivery_allocations_return_item
+        FOREIGN KEY (
+            organization_id,
+            return_item_id
+        )
+        REFERENCES returns.return_items (
+            organization_id,
+            return_item_id
+        )
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_return_delivery_allocations_package_content
+        FOREIGN KEY (
+            organization_id,
+            package_content_id
+        )
+        REFERENCES fulfillment.package_contents (
+            organization_id,
+            package_content_id
+        )
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT chk_return_delivery_allocations_quantity_positive
+        CHECK (allocated_quantity > 0)
+);
+--------------------------------------------------------------------
+------
+-------------------------------------------------------------------
