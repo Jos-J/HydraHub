@@ -464,7 +464,7 @@ BEGIN
      * Use one timestamp for both the package state change
      * and its immutable history event.
      */
-    v_event_at := CURRENT_TIMESTAMP;
+    v_event_at := CURRENT_TIMESTAMP AT TIME ZONE 'UTC';
 
     /*
      * Update current package state.
@@ -474,20 +474,32 @@ BEGIN
      * so this timestamp cannot later be rewritten normally.
      */
     UPDATE fulfillment.packages
-    SET
-        delivery_status_code = p_new_status_code,
+SET
+    delivery_status_code = p_new_status_code,
 
-        delivered_at =
-            CASE
-                WHEN p_new_status_code = 'delivered'
-                    THEN v_event_at
-                ELSE NULL
-            END,
+    delivered_at =
+        CASE
+            WHEN p_new_status_code = 'delivered'
+                THEN v_event_at
+            ELSE NULL
+        END,
 
-        updated_at = v_event_at
-    WHERE package_id = v_package.package_id
-    RETURNING *
-    INTO v_updated_package;
+    metadata =
+        CASE
+            WHEN p_new_status_code = 'delivered'
+                THEN jsonb_set(
+                    COALESCE(v_package.metadata, '{}'::jsonb),
+                    '{timestamp_convention}',
+                    '"UTC"'::jsonb,
+                    true
+                )
+            ELSE v_package.metadata
+        END,
+
+    updated_at = v_event_at
+WHERE package_id = v_package.package_id
+RETURNING *
+INTO v_updated_package;
 
     /*
      * Append immutable delivery history.
@@ -2574,71 +2586,113 @@ RETURNS TABLE (
     delivery_date DATE,
     resolved_policy_id BIGINT,
     policy_source TEXT,
-    policy_code VARCHAR(50),
+    policy_code VARCHAR,
     return_window_end_date DATE,
     is_return_eligible BOOLEAN,
     eligibility_code TEXT
 )
 LANGUAGE sql
 STABLE
-AS $$
+AS $function$
+
+    WITH delivery_context AS (
+        SELECT
+            diq.organization_id,
+            diq.sales_order_id,
+            diq.sales_order_item_id,
+            diq.variant_id,
+            diq.package_content_id,
+            diq.delivered_quantity,
+
+            CASE
+                WHEN p.metadata ->> 'timestamp_convention' = 'UTC'
+                    THEN (
+                        diq.delivered_at AT TIME ZONE 'UTC'
+                        AT TIME ZONE o.timezone
+                    )::date
+
+                WHEN p.metadata ->> 'timestamp_convention'
+                     = 'LEGACY_UNVERIFIED'
+                    THEN diq.delivered_at::date
+
+                ELSE NULL
+            END AS delivery_date
+
+        FROM returns.delivered_item_quantities diq
+
+        JOIN fulfillment.packages p
+            ON p.organization_id = diq.organization_id
+           AND p.package_id = diq.package_id
+
+        JOIN public.organizations o
+            ON o.organization_id = diq.organization_id
+
+        WHERE diq.organization_id = p_organization_id
+          AND diq.package_content_id = p_package_content_id
+          AND p_evaluation_date IS NOT NULL
+    )
+
     SELECT
-        diq.organization_id,
-        diq.sales_order_id,
-        diq.sales_order_item_id,
-        diq.variant_id,
-        diq.package_content_id,
-        diq.delivered_quantity,
-        diq.delivered_at::date AS delivery_date,
+        dc.organization_id,
+        dc.sales_order_id,
+        dc.sales_order_item_id,
+        dc.variant_id,
+        dc.package_content_id,
+        dc.delivered_quantity,
+        dc.delivery_date,
 
         rp.resolved_policy_id,
         rp.policy_source,
         rp.policy_code,
 
         CASE
-            WHEN rp.return_window_days IS NOT NULL
-                THEN diq.delivered_at::date
-                     + rp.return_window_days
+            WHEN dc.delivery_date IS NOT NULL
+             AND rp.return_window_days IS NOT NULL
+                THEN dc.delivery_date + rp.return_window_days
             ELSE NULL
         END AS return_window_end_date,
 
         CASE
+            WHEN dc.delivery_date IS NULL THEN FALSE
             WHEN rp.resolved_policy_id IS NULL THEN FALSE
-            WHEN rp.policy_is_active = FALSE THEN FALSE
-            WHEN rp.is_returnable = FALSE THEN FALSE
-            WHEN p_evaluation_date <
-                 diq.delivered_at::date THEN FALSE
+            WHEN rp.policy_is_active IS DISTINCT FROM TRUE THEN FALSE
+            WHEN rp.is_returnable IS DISTINCT FROM TRUE THEN FALSE
+            WHEN p_evaluation_date < dc.delivery_date THEN FALSE
             WHEN p_evaluation_date >
-                 (diq.delivered_at::date + rp.return_window_days)
-                THEN FALSE
+                 dc.delivery_date + rp.return_window_days THEN FALSE
             ELSE TRUE
         END AS is_return_eligible,
 
         CASE
+            WHEN dc.delivery_date IS NULL
+                THEN 'DELIVERY_TIMEZONE_UNVERIFIED'
+
             WHEN rp.resolved_policy_id IS NULL
                 THEN 'RETURN_POLICY_NOT_CONFIGURED'
-            WHEN rp.policy_is_active = FALSE
+
+            WHEN rp.policy_is_active IS DISTINCT FROM TRUE
                 THEN 'RETURN_POLICY_INACTIVE'
-            WHEN rp.is_returnable = FALSE
+
+            WHEN rp.is_returnable IS DISTINCT FROM TRUE
                 THEN 'PRODUCT_NOT_RETURNABLE'
-            WHEN p_evaluation_date < diq.delivered_at::date
+
+            WHEN p_evaluation_date < dc.delivery_date
                 THEN 'ITEM_NOT_YET_DELIVERED'
+
             WHEN p_evaluation_date >
-                 (diq.delivered_at::date + rp.return_window_days)
+                 dc.delivery_date + rp.return_window_days
                 THEN 'RETURN_WINDOW_EXPIRED'
+
             ELSE 'ELIGIBLE'
         END AS eligibility_code
 
-    FROM returns.delivered_item_quantities diq
+    FROM delivery_context dc
 
     LEFT JOIN returns.resolved_variant_return_policies rp
-        ON rp.organization_id = diq.organization_id
-       AND rp.variant_id = diq.variant_id
+        ON rp.organization_id = dc.organization_id
+       AND rp.variant_id = dc.variant_id;
 
-    WHERE diq.organization_id = p_organization_id
-      AND diq.package_content_id = p_package_content_id
-      AND p_evaluation_date IS NOT NULL;
-$$;
+$function$;
 ---------------------------------------------------------
 ------------ function evaluate item return quantity
 --------------------------------------------------------
@@ -2777,6 +2831,470 @@ CREATE TABLE returns.return_item_delivery_allocations (
     CONSTRAINT chk_return_delivery_allocations_quantity_positive
         CHECK (allocated_quantity > 0)
 );
---------------------------------------------------------------------
-------
--------------------------------------------------------------------
+----------------------------------------------------------------------
+------ function fulfillment.protect_delivery_timestamp_convention()
+----------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fulfillment.protect_delivery_timestamp_convention()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_old_convention TEXT;
+    v_new_convention TEXT;
+BEGIN
+    v_old_convention :=
+        OLD.metadata ->> 'timestamp_convention';
+
+    v_new_convention :=
+        NEW.metadata ->> 'timestamp_convention';
+
+    -- Protect the convention of an already delivered package.
+    IF OLD.delivery_status_code = 'delivered'
+       AND v_old_convention IS DISTINCT FROM v_new_convention
+    THEN
+        RAISE EXCEPTION
+            'Cannot modify timestamp convention for delivered package %',
+            OLD.package_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+	-- Protect the original delivery timestamp.
+IF OLD.delivery_status_code = 'delivered'
+   AND OLD.delivered_at IS DISTINCT FROM NEW.delivered_at
+THEN
+    RAISE EXCEPTION
+        'Cannot modify delivered_at for delivered package %',
+        OLD.package_id
+        USING ERRCODE = 'P0001';
+END IF;
+
+    -- Every newly delivered package must have a valid convention.
+    IF OLD.delivery_status_code IS DISTINCT FROM 'delivered'
+       AND NEW.delivery_status_code = 'delivered'
+       AND v_new_convention IS DISTINCT FROM 'UTC'
+    THEN
+        RAISE EXCEPTION
+            'Newly delivered package % must use UTC timestamp convention',
+            NEW.package_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+-------------------------------------------------------------------------
+-------------------- trigger protect  delivery timestamp convention
+-------------------------------------------------------------------------
+DROP TRIGGER trg_protect_delivery_timestamp_convention
+ON fulfillment.packages;
+
+CREATE TRIGGER trg_protect_delivery_timestamp_convention
+BEFORE UPDATE OF metadata, delivery_status_code, delivered_at
+ON fulfillment.packages
+FOR EACH ROW
+EXECUTE FUNCTION fulfillment.protect_delivery_timestamp_convention();
+-------------------------------------------------------------------------
+------------ function validate return delivery allocation 
+-------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION returns.validate_return_delivery_allocation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_return_item returns.return_items%ROWTYPE;
+    v_return_status VARCHAR(30);
+    v_requested_at TIMESTAMPTZ;
+    v_request_date DATE;
+    v_timezone VARCHAR(100);
+
+    v_delivery RECORD;
+    v_eligibility RECORD;
+
+    v_fulfilled_quantity INTEGER;
+    v_item_allocated BIGINT;
+    v_package_allocated BIGINT;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.organization_id IS DISTINCT FROM NEW.organization_id
+           OR OLD.return_item_id IS DISTINCT FROM NEW.return_item_id
+           OR OLD.package_content_id IS DISTINCT FROM NEW.package_content_id
+        THEN
+            RAISE EXCEPTION
+                'Allocation identifiers cannot be changed';
+        END IF;
+    END IF;
+
+    -- Find the return item before acquiring the shared lock.
+    SELECT *
+    INTO v_return_item
+    FROM returns.return_items
+    WHERE organization_id = NEW.organization_id
+      AND return_item_id = NEW.return_item_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Return item % not found in organization %',
+            NEW.return_item_id,
+            NEW.organization_id;
+    END IF;
+
+    -- Serialize allocations for the same sales-order item.
+    SELECT soi.fulfilled_quantity
+    INTO v_fulfilled_quantity
+    FROM public.sales_order_items soi
+    WHERE soi.sales_order_item_id = v_return_item.sales_order_item_id
+      AND soi.sales_order_id = v_return_item.sales_order_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Original sales-order item not found';
+    END IF;
+
+    -- Read parent return status and original request date.
+    SELECT
+        rs.status_code,
+        r.requested_at,
+        o.timezone
+    INTO
+        v_return_status,
+        v_requested_at,
+        v_timezone
+    FROM returns.returns r
+    JOIN returns.return_statuses rs
+        ON rs.return_status_id = r.return_status_id
+    JOIN public.organizations o
+        ON o.organization_id = r.organization_id
+    WHERE r.organization_id = NEW.organization_id
+      AND r.return_id = v_return_item.return_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Parent return not found';
+    END IF;
+
+    IF v_return_status IN ('cancelled', 'rejected', 'completed') THEN
+        RAISE EXCEPTION
+            'Cannot allocate delivery to return with status %',
+            v_return_status;
+    END IF;
+
+    IF v_return_status IN (
+        'partially_received',
+        'received',
+        'inspecting'
+    )
+       OR v_return_item.quantity_received > 0
+    THEN
+        RAISE EXCEPTION
+            'Cannot modify allocations after receiving begins';
+    END IF;
+
+    v_request_date :=
+        (v_requested_at AT TIME ZONE v_timezone)::DATE;
+
+    -- Confirm that the specific package content was delivered.
+    SELECT
+        diq.sales_order_id,
+        diq.sales_order_item_id,
+        diq.variant_id,
+        diq.delivered_quantity
+    INTO v_delivery
+    FROM returns.delivered_item_quantities diq
+    WHERE diq.organization_id = NEW.organization_id
+      AND diq.package_content_id = NEW.package_content_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Package content % is not delivered',
+            NEW.package_content_id;
+    END IF;
+
+    IF v_delivery.sales_order_id
+           IS DISTINCT FROM v_return_item.sales_order_id
+       OR v_delivery.sales_order_item_id
+           IS DISTINCT FROM v_return_item.sales_order_item_id
+       OR v_delivery.variant_id
+           IS DISTINCT FROM v_return_item.variant_id
+    THEN
+        RAISE EXCEPTION
+            'Package content does not match the return item';
+    END IF;
+
+    -- Evaluate eligibility on the original request date.
+    SELECT *
+    INTO v_eligibility
+    FROM returns.evaluate_return_eligibility(
+        NEW.organization_id,
+        NEW.package_content_id,
+        v_request_date
+    );
+
+    IF NOT FOUND
+       OR v_eligibility.is_return_eligible IS DISTINCT FROM TRUE
+    THEN
+        RAISE EXCEPTION
+            'Delivery allocation is not eligible: %',
+            COALESCE(
+                v_eligibility.eligibility_code,
+                'ELIGIBILITY_NOT_FOUND'
+            );
+    END IF;
+
+    -- Check the return-item allocation limit.
+    SELECT COALESCE(SUM(a.allocated_quantity), 0)
+    INTO v_item_allocated
+    FROM returns.return_item_delivery_allocations a
+    WHERE a.organization_id = NEW.organization_id
+      AND a.return_item_id = NEW.return_item_id
+      AND (
+          TG_OP = 'INSERT'
+          OR a.allocation_id <> NEW.allocation_id
+      );
+
+    IF v_item_allocated + NEW.allocated_quantity
+       > v_return_item.quantity_requested
+    THEN
+        RAISE EXCEPTION
+            'Allocation exceeds requested return quantity';
+    END IF;
+
+    -- Check the delivered package-content allocation limit.
+    SELECT COALESCE(SUM(a.allocated_quantity), 0)
+    INTO v_package_allocated
+    FROM returns.return_item_delivery_allocations a
+    JOIN returns.return_items ri
+      ON ri.organization_id = a.organization_id
+     AND ri.return_item_id = a.return_item_id
+    JOIN returns.returns r
+      ON r.organization_id = ri.organization_id
+     AND r.return_id = ri.return_id
+    JOIN returns.return_statuses rs
+      ON rs.return_status_id = r.return_status_id
+    WHERE a.organization_id = NEW.organization_id
+      AND a.package_content_id = NEW.package_content_id
+      AND rs.status_code NOT IN ('cancelled', 'rejected')
+      AND (
+          TG_OP = 'INSERT'
+          OR a.allocation_id <> NEW.allocation_id
+      );
+
+    IF v_package_allocated + NEW.allocated_quantity
+       > v_delivery.delivered_quantity
+    THEN
+        RAISE EXCEPTION
+            'Allocation exceeds delivered package-content quantity';
+    END IF;
+
+    RETURN NEW;
+END;
+$function$;
+-------------------------------------------------------------
+--------- function returns validate_return_status transition
+------------------------------------------------------------
+CREATE OR REPLACE FUNCTION returns.validate_return_status_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_old_status VARCHAR(30);
+    v_new_status VARCHAR(30);
+    v_allowed BOOLEAN := FALSE;
+BEGIN
+    -- No status change: allow the update.
+    IF NEW.return_status_id = OLD.return_status_id THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT status_code
+    INTO STRICT v_old_status
+    FROM returns.return_statuses
+    WHERE return_status_id = OLD.return_status_id;
+
+    SELECT status_code
+    INTO STRICT v_new_status
+    FROM returns.return_statuses
+    WHERE return_status_id = NEW.return_status_id;
+
+    v_allowed := CASE
+        WHEN v_old_status = 'requested'
+            THEN v_new_status IN (
+                'approved',
+                'rejected',
+                'cancelled'
+            )
+
+        WHEN v_old_status = 'approved'
+            THEN v_new_status IN (
+                'partially_received',
+                'received',
+                'cancelled'
+            )
+
+        WHEN v_old_status = 'partially_received'
+            THEN v_new_status IN (
+                'received'
+            )
+
+        WHEN v_old_status = 'received'
+            THEN v_new_status = 'inspecting'
+
+        WHEN v_old_status = 'inspecting'
+            THEN v_new_status = 'completed'
+
+        ELSE FALSE
+    END;
+
+    IF v_allowed IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION
+            'Invalid return status transition: % -> %',
+            v_old_status,
+            v_new_status
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    RETURN NEW;
+END;
+$function$;
+------------------------------------------------------
+------ trigger validate return status transition
+------------------------------------------------------
+CREATE TRIGGER trg_validate_return_status_transition
+BEFORE UPDATE OF return_status_id
+ON returns.returns
+FOR EACH ROW
+EXECUTE FUNCTION returns.validate_return_status_transition();
+-------------------------------------------------------------
+------------ function returns protection item mod
+-------------------------------------------------------------
+CREATE OR REPLACE FUNCTION returns.protect_return_item_modifications()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_status_code VARCHAR(30);
+    v_allocated_quantity BIGINT;
+    v_has_allocations BOOLEAN;
+BEGIN
+    -- Read the parent return's current status.
+    SELECT rs.status_code
+    INTO v_status_code
+    FROM returns.returns r
+    JOIN returns.return_statuses rs
+        ON rs.return_status_id = r.return_status_id
+    WHERE r.organization_id = OLD.organization_id
+      AND r.return_id = OLD.return_id
+    FOR SHARE OF r;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Parent return not found for return item %',
+            OLD.return_item_id;
+    END IF;
+
+    -- Check existing delivery allocations.
+    SELECT
+        COALESCE(SUM(a.allocated_quantity), 0),
+        COUNT(*) > 0
+    INTO
+        v_allocated_quantity,
+        v_has_allocations
+    FROM returns.return_item_delivery_allocations a
+    WHERE a.organization_id = OLD.organization_id
+      AND a.return_item_id = OLD.return_item_id;
+
+    IF TG_OP = 'DELETE' THEN
+        IF v_status_code <> 'requested'
+           OR OLD.quantity_received > 0
+           OR v_has_allocations
+        THEN
+            RAISE EXCEPTION
+                'Return item % cannot be deleted: status %, received quantity %, allocations exist %',
+                OLD.return_item_id,
+                v_status_code,
+                OLD.quantity_received,
+                v_has_allocations;
+        END IF;
+
+        RETURN OLD;
+    END IF;
+
+    -- Protect item identity.
+    IF OLD.organization_id IS DISTINCT FROM NEW.organization_id
+       OR OLD.return_id IS DISTINCT FROM NEW.return_id
+       OR OLD.sales_order_id IS DISTINCT FROM NEW.sales_order_id
+       OR OLD.sales_order_item_id IS DISTINCT FROM NEW.sales_order_item_id
+       OR OLD.variant_id IS DISTINCT FROM NEW.variant_id
+    THEN
+        IF v_has_allocations OR OLD.quantity_received > 0 THEN
+            RAISE EXCEPTION
+                'Cannot change return-item identity after allocation or receiving';
+        END IF;
+    END IF;
+
+    -- Prevent requested quantity falling below allocations.
+    IF NEW.quantity_requested < v_allocated_quantity THEN
+        RAISE EXCEPTION
+            'Requested quantity % cannot be less than allocated quantity %',
+            NEW.quantity_requested,
+            v_allocated_quantity;
+    END IF;
+
+    -- Freeze requested quantity after receiving begins.
+    IF NEW.quantity_requested IS DISTINCT FROM OLD.quantity_requested
+       AND (
+           v_status_code IN (
+               'partially_received',
+               'received',
+               'inspecting',
+               'completed'
+           )
+           OR OLD.quantity_received > 0
+       )
+    THEN
+        RAISE EXCEPTION
+            'Cannot change requested quantity after receiving begins';
+    END IF;
+
+    RETURN NEW;
+END;
+$function$;
+--------------------------------------------------------------------------
+----------function protect returns identity
+--------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION returns.protect_return_identity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    IF NEW.organization_id IS DISTINCT FROM OLD.organization_id
+       OR NEW.return_id IS DISTINCT FROM OLD.return_id
+       OR NEW.sales_order_id IS DISTINCT FROM OLD.sales_order_id
+       OR NEW.customer_id IS DISTINCT FROM OLD.customer_id
+       OR NEW.requested_at IS DISTINCT FROM OLD.requested_at
+    THEN
+        RAISE EXCEPTION
+            'Cannot modify the original identity or request date of return %',
+            OLD.return_id
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    RETURN NEW;
+END;
+$function$;
+--------------------------------------------------------------------------------
+------------trigger protect return
+--------------------------------------------------------------------------------
+CREATE TRIGGER trg_protect_return_identity
+BEFORE UPDATE OF
+    organization_id,
+    return_id,
+    sales_order_id,
+    customer_id,
+    requested_at
+ON returns.returns
+FOR EACH ROW
+EXECUTE FUNCTION returns.protect_return_identity();
+----------------------------------------------------------------------
+----------
+-----------------------------------------------------------------------
